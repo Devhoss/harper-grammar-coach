@@ -129,11 +129,13 @@ app, or trigger the reconcile from the Plugins page) and confirm the bytes moved
 
 ## Bumping the harper-ls pin
 
-`tests/test_harper_ls.py` asserts the allowlist against the release manifest, so a stale pin
-fails loudly. To move versions:
+The table's shape is checked offline; the live comparison in `tests/test_harper_ls.py` needs
+`HARPER_PIN_TEST=1` and runs in the scheduled CI job, so a stale pin fails there rather than
+silently on a user's machine. To move versions:
 
-1. Open the release page for the new tag and read the asset names and sizes for the six
-   supported targets.
+1. Open the release page for the new tag and read the asset name and size for each of the five
+   release assets (`RELEASE_ASSETS` has six rows because `platform.machine()` reports Windows
+   x86_64 as both `AMD64` and `x86_64`).
 2. Edit `HARPER_VERSION` and every entry in `RELEASE_ASSETS` in `harper_ls.py`. The docstring
    says where the numbers come from; keep that true.
 3. `python scripts/fetch_harper_ls.py --verify-only` — downloads, checks the size gate,
