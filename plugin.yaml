@@ -1,0 +1,27 @@
+name: harper-grammar-coach
+version: 0.1.0
+description: >-
+  Grammar and spelling coaching for the Hermes Desktop chat composer. A persistent offline
+  Harper language server (harper-ls) lints the draft as you type, suggestions appear in a
+  native strip below the composer, and high-confidence fixes can be applied automatically
+  when you press Enter. No text ever leaves your machine.
+author: Devhoss
+license: MIT
+homepage: https://github.com/Devhoss/harper-grammar-coach
+tags: [desktop, composer, grammar, spelling, writing, harper, offline]
+kind: standalone
+requires_hermes: ">=0.1.0"
+# FastAPI comes from the Hermes process that mounts this plugin, so there is nothing for
+# Hermes to prepare. `external` also keeps the contributor pyproject.toml out of the shared
+# environment: without it, a pyproject makes this package a member of that environment.
+python_runtime: external
+provides_tools: []
+provides_hooks: []
+config_schema:
+  harper_ls_path:
+    type: str
+    default: ""
+    description: >-
+      Absolute path to a harper-ls binary. Leave empty to use the copy POST /bootstrap
+      installs into vendor/, or whatever `harper-ls` resolves to on PATH. The
+      HARPER_LS_PATH environment variable takes precedence over this setting.

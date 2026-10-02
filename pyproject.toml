@@ -1,0 +1,33 @@
+[project]
+name = "harper-grammar-coach"
+version = "0.1.0"
+description = "Offline grammar and spelling coaching for the Hermes Desktop chat composer, powered by harper-ls."
+requires-python = ">=3.11"
+# No runtime dependencies, on purpose. The backend is FastAPI + the standard library, and
+# FastAPI comes from the Hermes process that mounts this plugin — not from this package.
+# This pyproject is contributor tooling (ruff + pytest) and nothing else; plugin.yaml opts
+# the package out of Hermes' shared environment with `python_runtime: external`.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# UP is deliberately off. The engine module is written in `typing.Optional`/`typing.Dict`
+# style; turning UP on asks for a PEP 604 rewrite of ~80 working annotations, which is a
+# change of its own and not part of packaging. Correctness rules (pyflakes, bugbear,
+# isort, pycodestyle) all run.
+select = ["E", "F", "I", "B"]
+ignore = ["E501", "E402"]

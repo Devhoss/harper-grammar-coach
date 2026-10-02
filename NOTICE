@@ -1,0 +1,32 @@
+Attribution notices
+===================
+
+Harper Grammar Coach
+--------------------
+Copyright (c) 2026 Devhoss
+Licensed under the MIT License. See LICENSE.
+
+harper-ls / Harper
+------------------
+This plugin is a client for Harper, developed by Automattic.
+
+  Project:  https://github.com/Automattic/harper
+  Binary:   harper-ls, the language-server executable this plugin runs as a
+            subprocess
+  License:  Apache License 2.0 — the full text is reproduced in
+            licenses/APACHE-2.0-harper-ls.txt
+  Pinned:   v2.12.0, pinned per-platform with exact release-asset byte sizes in
+            harper_ls.py
+
+This repository does NOT contain a Harper binary. ``harper-ls`` is downloaded on
+demand, from the pinned GitHub release, only when the user triggers it (see
+SECURITY.md). When you do install one, the copy that lands in ``vendor/`` remains
+redistributable under Apache-2.0 provided this notice and the license text travel
+with any redistribution of that directory.
+
+"Harper" is a trademark of its respective owners. Mentioning it here is
+descriptive only — naming the engine this plugin drives — and implies no
+sponsorship, affiliation or endorsement by Automattic.
+
+Third-party software listed here is distributed under its own terms, which take
+precedence over the MIT license above for that software only.
