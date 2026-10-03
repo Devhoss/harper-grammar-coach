@@ -181,6 +181,20 @@ profile's plugin installation; it is not part of the Git repository.
 | Long drafts stop getting suggestions | The text is truncated to a bound and the Harper UI says so; Harper re-parses the whole document per action, so cost grows with length. |
 | Engine vanished after a while | It reaps itself after 10 minutes idle, by design, and restarts on the next check. |
 
+## Known Hermes Desktop install blocker
+
+On current Hermes builds, a normal **Install from Git** can be blocked by Hermes' plugin security scanner even though Harper itself is packaged and validated correctly. The current reproducible case reports three caution findings:
+
+- **HIGH** `inline_shell_exec` at `technical_spans.py:34` — a false positive on the Markdown-backtick regex used to recognise inline code. This expression is not executable shell syntax.
+- **MEDIUM** `python_subprocess` at `dashboard/plugin_api.py:341` — the required `harper-ls` process launch.
+- **LOW** loopback URL fixture at `tests/test_technical_spans.py:106`.
+
+The high finding causes the overall verdict to be **CAUTION**, so Hermes' normal community-source install gate reports **BLOCKED**. The same package can be installed with **Force reinstall**, which explicitly overrides that caution gate, and the plugin then loads normally. No Hermes-core or Harper-side scanner workaround is used by this repository.
+
+This is a **Hermes scanner issue**, not a Harper Grammar Coach runtime failure. The plugin keeps the scanner-visible implementation unchanged rather than rewriting harmless code merely to evade the detector. Until Hermes correctly distinguishes regex syntax from executable inline-shell syntax, use the explicit force-install override only when you trust the repository. Once the Hermes scanner is fixed, the normal Git installation path should work without any Harper changes.
+
+The blocker has been reproduced from both the Hermes CLI and the Desktop **Install from Git** flow. This note should remain until the upstream scanner behavior is corrected.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout, the test/lint commands, how to work
