@@ -2,9 +2,9 @@ name: harper-grammar-coach
 version: 0.1.0
 description: >-
   Grammar and spelling coaching for the Hermes Desktop chat composer. A persistent offline
-  Harper language server (harper-ls) lints the draft as you type, suggestions appear in a
-  native strip below the composer, and high-confidence fixes can be applied automatically
-  when you press Enter. No text ever leaves your machine.
+  Harper language server (harper-ls) lints the draft as you type and shows suggestions in a
+  composer popover. High-confidence fixes can optionally be applied when you press Enter.
+  No text ever leaves your machine.
 author: Devhoss
 license: MIT
 homepage: https://github.com/Devhoss/harper-grammar-coach
@@ -25,3 +25,11 @@ config_schema:
       Absolute path to a harper-ls binary. Leave empty to use the copy POST /bootstrap
       installs into vendor/, or whatever `harper-ls` resolves to on PATH. The
       HARPER_LS_PATH environment variable takes precedence over this setting.
+  correct_on_send:
+    type: bool
+    default: false
+    label: Correct on send
+    description: >-
+      Automatically apply high-confidence spelling corrections when sending. Off by default so
+      technical terms, product names, commands, and identifiers are not silently changed unless
+      you explicitly enable this setting.

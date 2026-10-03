@@ -18,6 +18,10 @@ venv/
 .hermes/
 *.log
 
+# Dev-only renderer test dependencies. package-lock.json IS committed: CI runs `npm ci`.
+node_modules/
+npm-debug.log*
+
 # Editors / OS
 .vscode/
 .idea/

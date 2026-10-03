@@ -77,6 +77,7 @@ def client(api, monkeypatch):
                 "text": "",
                 "suggestions": [],
                 "diagnosticCount": 0,
+                "technicalSuppressed": 0,
                 "truncated": False,
                 "engineMs": 1.0,
                 "cached": False,

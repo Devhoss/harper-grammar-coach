@@ -167,6 +167,14 @@ def test_the_harper_ls_path_setting_matches_the_code(manifest, repo_root):
     assert "harper_ls_path" in source
 
 
+def test_correct_on_send_is_a_visible_opt_in_plugin_setting(manifest):
+    setting = manifest["config_schema"]["correct_on_send"]
+    assert setting["type"] == "bool"
+    assert setting["default"] is False
+    assert setting["label"] == "Correct on send"
+    assert "technical terms" in setting["description"]
+
+
 # --- the two halves ----------------------------------------------------------
 
 

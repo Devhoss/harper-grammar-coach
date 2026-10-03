@@ -1,10 +1,10 @@
 # Harper Grammar Coach
 
 Grammar and spelling coaching for the Hermes Desktop chat composer, powered by
-[Harper](https://github.com/Automattic/harper). It lints your draft as you type, shows
-suggestions in a strip below the composer, and can apply high-confidence fixes when you
-press Enter. **Everything runs on your machine** — no text is uploaded, and the engine is a
-local subprocess, not a cloud API.
+[Harper](https://github.com/Automattic/harper). It lints your draft as you type and opens a
+composer popover for new suggestions. High-confidence fixes on Enter are optional and off by
+default. **Everything runs on your machine** — no text is uploaded, and the engine is a local
+subprocess, not a cloud API.
 
 | | |
 |---|---|
@@ -15,30 +15,44 @@ local subprocess, not a cloud API.
 
 ## Install
 
-Either door installs the same complete package; use whichever you have.
+Harper is one Git repository containing an Agent half and a Desktop half. The Agent half is
+installed separately in each Hermes profile. On a local Hermes Desktop backend, Hermes
+materializes one shared Desktop half from an installed Agent package. The Desktop half is
+app-wide; it is not copied into each profile.
+
+The public source repository is `Devhoss/harper-grammar-coach`.
 
 ### From the Hermes CLI
 
 ```bash
 hermes plugins install Devhoss/harper-grammar-coach --enable
-hermes gateway restart          # or restart the Hermes app
 ```
 
-The restart is what mounts the plugin's dashboard API. Hermes mounts plugin API routes when
-the server starts, so a freshly installed plugin answers 404 until then.
+Run this in the profile that should use Harper. `--enable` enables its Agent half. If the
+profile's gateway is already running and does not activate the new plugin immediately, restart
+that gateway (or restart Hermes Desktop) so it mounts the plugin's dashboard API.
 
 ### From Hermes Desktop
 
-**Capabilities ▸ Plugins ▸ Install from Git**, paste `Devhoss/harper-grammar-coach`, and
-leave both halves ticked. For a local backend the desktop half is materialized out of the
-same installed package rather than cloned separately, so one install gives you one row on the
-Plugins page. Then flip the plugin's switch on that page and restart Hermes.
+Open **Capabilities ▸ Plugins ▸ Install from Git**, enter the public GitHub repository, choose
+the target Agent profile, and select the Agent and Desktop halves. With a local backend, Hermes
+installs the Agent package in that profile and materializes the Desktop half from that same Git
+checkout. Enable the Agent and Desktop switches on the Plugins page as needed. The shared
+Desktop half is not cloned a second time.
+
+### Install into another Agent profile
+
+The Agent half does not carry over when you switch profiles. Select the other profile in the
+Agent column and use **Install from Git** for the same repository, or choose **Install here** on
+the existing unified package row when that action is available. Hermes uses the package's Git
+provenance and installs the Agent half into the selected profile; there is no folder-copy step.
+Each profile has its own enable decision. The Desktop half remains shared by the app.
 
 ### First run: install the engine
 
-The `harper-ls` binary is **not** in this repository — a ~60 MB executable in a plugin tree
-trips Hermes' security scanner and makes the package uninstallable without `--force`. Fetch
-it once, on purpose:
+The `harper-ls` binary is **not** in this repository. It is a large platform-specific
+executable, so the plugin downloads the verified asset only when you request it. Fetch it
+once, on purpose:
 
 1. Open the Desktop settings section for this plugin (below the composer, or
    **Settings ▸ Plugins ▸ Harper Grammar Coach**).
@@ -55,21 +69,72 @@ refused with `unsupported-platform` rather than guessed at; use the setting belo
 
 ## Use
 
-Type. A strip appears under the composer with Harper's suggestions — spelling,
-capitalisation and grammar rewrites — each with a confidence level and an **Apply** action.
+Type. When Harper finds suggestions, the composer shows **Harper · N** and opens a popover
+with spelling, capitalisation and grammar rewrites plus their confidence levels. **Click a
+row to apply that suggestion**: the correction row is one accessible button, and Ignore is a
+separate control. **Apply all** stays at the top. The underside list remains available in
+**Suggestion display** settings, and the statusbar provides fallback access when multiple
+composer surfaces are mounted.
 
-Settings, all in the plugin's own settings section:
+The popover opens once for a new set of visible suggestions. Closing it keeps that set
+dismissed through identical rechecks. A set is distinct when its rule, category, incorrect
+word, or replacement changes; moving the same suggestion to a different offset does not reopen
+it. An empty result resets the cycle. Applying a correction keeps the current open state and
+verified remaining suggestions while Harper re-checks.
+
+After you apply one, its row disappears immediately and the remaining rows stay on screen
+while the updated draft is re-checked — the count reads `2 suggestions · checking…` instead
+of blanking the list. Rows carried across that recheck are re-verified against the new text,
+so an old suggestion can never be applied to a draft it was not computed for.
+
+Your code and paths are left alone. Fenced blocks, inline `code`, URLs, Windows and Unix
+paths, shell commands, package and file names, config keys and `camelCase`/`snake_case`
+identifiers are recognised from **context**, not from a word list, and are never offered for
+rewrite — by Harper suggestions or submit-time auto-fix. This draft:
+
+```
+I think the backend dont respond when I run `npm run dev` from E:\hermes\profiles\coder.
+```
+
+yields exactly one suggestion, `dont` → `don't`, and changes nothing inside the command or
+the path. The same word is judged on its context — in this draft only the prose occurrence is
+offered for rewrite, while the code span and the file name are not:
+
+```
+The config key is config, but `config` is code and config.yaml is a file.
+```
+
+The **Correct on send** switch is a manifest-backed setting in the Harper plugin's settings gear
+under **Capabilities → Plugins**. It persists as `plugins.entries.harper-grammar-coach.settings.correct_on_send` and defaults to false. The renderer reads that saved value when a message is submitted. Other preference controls are in Harper's Appearance contribution:
 
 - **Check while typing** on/off, with a **debounce** of Fast (400 ms) / Normal (700 ms) /
   Relaxed (1500 ms).
-- **Correct high-confidence issues on send**, per category (spelling, capitalisation,
-  grammar rewrites), with a **minimum confidence** of High or Medium.
+- **Correct on send** is **off by default**. Enable it to opt into
+  eligible high-confidence prose corrections when sending. Categories (spelling,
+  capitalisation, grammar rewrites) and **minimum confidence** (High or Medium) are
+  configurable. Existing saved on/off preferences are preserved.
 - **Dialect**: American, British, Canadian, Australian.
 - **Engine**: state, version, dialect, check count and last check latency; **Install Harper**
   and **Restart** actions.
 
-Palette commands: **Harper: Check draft now**, **Harper: Apply all suggestions**, and a
-toggle for live checking.
+Applying a suggestion moves the caret to the end of the draft. That is a documented limit of
+the composer API available to a plugin, not a choice made per case.
+
+Palette commands: **Harper: Check draft now**, **Harper: Open suggestions**, **Harper: Apply
+all suggestions**, and a toggle for live checking. Keyboard shortcuts are available for
+opening suggestions and applying all.
+
+### What Harper itself will not tell you
+
+The engine is Harper (`harper-ls`), and the plugin shows what Harper returns — no more.
+Measured on harper-ls 2.12.0: `Thiss is a sentenc whit two mistaks` produces three
+suggestions, but `This are a simple test.` and `There is many reasons why this happens.`
+produce nothing at all, because Harper's agreement rules cover pronoun-plus-*be*
+(`I is ready.`, `He are working.`) and a bare plural (`There is dogs.`), not
+demonstrative or quantified subjects. Nothing in this plugin's filtering or configuration can
+recover a lint the engine never raises, and the plugin does not fake one with a model: it
+reports what the engine saw (`diagnosticCount`) separately from what it filtered out
+(`technicalSuppressed`), so an over-eager filter is visible instead of silent.
 
 ## Using your own harper-ls
 
@@ -87,16 +152,20 @@ plugin uses the `vendor/` copy it installed, then `harper-ls` on `PATH`.
 ## Updating and removing
 
 ```bash
-hermes plugins update harper-grammar-coach   # pulls the pinned-source revision
-hermes gateway restart
-hermes plugins disable harper-grammar-coach
+hermes plugins update harper-grammar-coach
 hermes plugins uninstall harper-grammar-coach
 ```
 
+Run those commands in the profile being updated or removed. To target a named profile from the
+CLI, prefix either command with `hermes -p PROFILE`. Uninstalling removes that profile's
+Agent half and its provenance record. The shared Desktop half remains while another profile
+still has the package installed; Hermes removes it when no installed profile supplies it and
+the Desktop plugin inventory is reconciled.
+
 `harper_ls.py` owns the engine version pin, so a plugin update can move to a different
-`harper-ls` release; the new binary is fetched on the next **Install Harper** press rather
-than silently replaced under a running process. `vendor/` is gitignored and is yours to keep
-across updates.
+`harper-ls` release. The new binary is fetched on the next **Install Harper** action rather
+than silently replaced under a running process. `vendor/` is gitignored and belongs to the
+profile's plugin installation; it is not part of the Git repository.
 
 ## Troubleshooting
 
@@ -108,7 +177,8 @@ across updates.
 | `unsupported-platform` | No pinned release asset for this OS/architecture. Install `harper-ls` yourself and point `HARPER_LS_PATH` at it. |
 | `size-mismatch` on install | The download did not match the pinned byte size. Do not retry around it — something between you and GitHub changed the payload. |
 | First check is slow, later ones are fast | Expected. Harper's dictionary warmup (~2 s) is paid once, at startup, not per keystroke. |
-| Long drafts stop getting suggestions | The text is truncated to a bound and the strip says so; Harper re-parses the whole document per action, so cost grows with length. |
+| A mistake you can see is not offered | Usually Harper, not the filter. `GET …/check` reports `diagnosticCount` (what Harper raised) and `technicalSuppressed` (what the plugin dropped as machine text); if both are 0 the engine never flagged it. See "What Harper itself will not tell you". |
+| Long drafts stop getting suggestions | The text is truncated to a bound and the Harper UI says so; Harper re-parses the whole document per action, so cost grows with length. |
 | Engine vanished after a while | It reaps itself after 10 minutes idle, by design, and restarts on the next check. |
 
 ## Development

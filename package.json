@@ -1,0 +1,15 @@
+{
+  "name": "harper-grammar-coach-devtests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Development-only harness for the renderer half (desktop/plugin.js). The shipped plugin installs NO JavaScript: it imports only @hermes/plugin-sdk and react, both supplied by the Hermes renderer. These devDependencies exist so `npm test` can load the real plugin module under node:test with a stub SDK, and so one interaction test can render it in jsdom.",
+  "scripts": {
+    "test": "node --import ./tests/renderer/register.mjs --test \"tests/renderer/*.test.mjs\""
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  }
+}

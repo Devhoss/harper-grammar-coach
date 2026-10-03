@@ -64,8 +64,8 @@ gains a log call that interpolates the checked text.
 app's full authority. It therefore stays inside the constraints Hermes lints desktop surfaces
 for: no dynamic code evaluation, no dynamic `import()` outside `@hermes/plugin-sdk` and
 `react`, no script injection, no reaching into the application's own DOM, and no observing
-`document.body`. It adds its own suggestion strip below the composer and edits text only
-through the plugin SDK's own surface.
+`document.body`. It adds a plugin-owned composer popover (with the underside list as an
+optional fallback) and edits text only through the plugin SDK's own surface.
 
 ## Reporting a vulnerability
 

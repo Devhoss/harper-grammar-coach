@@ -12,6 +12,7 @@ surfaces in review costs a round trip.
 
 from __future__ import annotations
 
+import ast
 import re
 
 import pytest
@@ -111,10 +112,18 @@ def test_no_shell_execution_and_no_dynamic_code(repo_root):
 
 
 def test_the_engine_is_spawned_from_an_argument_vector(api_source):
-    """`[binary, "--stdio"]` on stdin/stdout pipes — never a command string, so nothing about
-    the resolved path can be reinterpreted by a shell."""
-    assert "subprocess.Popen(" in api_source
-    assert '[binary, "--stdio"]' in api_source
+    """The launcher receives an argv list and never asks for shell interpretation."""
+    tree = ast.parse(api_source)
+    launcher = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "Popen"
+    )
+
+    assert isinstance(launcher.args[0], ast.List)
+    assert not any(keyword.arg == "shell" for keyword in launcher.keywords)
 
 
 # --- desktop half: the renderer's authority ---------------------------------

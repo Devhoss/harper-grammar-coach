@@ -15,8 +15,8 @@
  * there is no sanctioned caret restore, so a linter that auto-applied while you
  * type would yank the caret to the end of the draft on every correction. The
  * only automation is at submit time, where the draft is cleared immediately
- * afterwards and the caret is moot. Individual "Apply" accepts one caret jump
- * to the end — documented in the settings panel, not hidden.
+ * afterwards and the caret is moot. Clicking a suggestion ROW accepts one caret
+ * jump to the end — documented in the settings panel, not hidden.
  */
 
 import {
@@ -25,6 +25,7 @@ import {
   Button,
   COMPOSER_AREAS,
   GlyphSpinner,
+  KEYBINDS_AREA,
   ListRow,
   PALETTE_AREA,
   Popover,
@@ -65,6 +66,11 @@ const CHECK_TIMEOUT_MS = 8_000
 /** After a timeout the debounce is re-armed rather than left spent: a slow answer
  *  is a blip, and the user should not have to edit the draft to get a check back. */
 const CHECK_RETRY_MS = 3_000
+/** Startup/readiness retries for the plugin API. A cold Desktop profile can
+ *  briefly send the first request to the primary backend before its active
+ *  profile scope is installed. Keep that recovery bounded and well below the
+ *  much longer per-request timeout budget. */
+const WARM_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 15_000]
 /** Server-side ceiling for the code-action phase, in ms. That phase is the only part
  *  of a check that grows with the draft — Harper re-parses the whole document per
  *  action (~14 ms at 1k chars, ~254 ms at 20k) — so the renderer states how long it is
@@ -112,11 +118,12 @@ const DEBOUNCES = [
 ]
 const DEFAULTS = {
   live: true,
-  correctOnSend: true,
+  correctOnSend: false,
   categories: { spelling: true, capitalisation: true, grammar: false },
   minPriority: 60,
   dialect: 'American',
-  debounce: 'normal'
+  debounce: 'normal',
+  suggestionDisplay: 'popover'
 }
 
 /** An `@ref` chip marker. Requires preceding whitespace so an ordinary
@@ -143,7 +150,10 @@ export function normalizeSettings(raw) {
     },
     minPriority: PRIORITIES.some(p => p.id === src.minPriority) ? src.minPriority : DEFAULTS.minPriority,
     dialect: DIALECTS.some(d => d.id === src.dialect) ? src.dialect : DEFAULTS.dialect,
-    debounce: DEBOUNCES.some(d => d.id === src.debounce) ? src.debounce : DEFAULTS.debounce
+    debounce: DEBOUNCES.some(d => d.id === src.debounce) ? src.debounce : DEFAULTS.debounce,
+    suggestionDisplay: ['popover', 'underside'].includes(src.suggestionDisplay)
+      ? src.suggestionDisplay
+      : DEFAULTS.suggestionDisplay
   }
 }
 
@@ -301,6 +311,65 @@ export function pickForAutoFix(suggestions, settings) {
   })
 }
 
+/** The rows that survive an apply, already in the NEW draft's coordinates.
+ *
+ *  A click must not blank the strip while the next check runs, and it must not show a row whose
+ *  offsets belong to the old text either. So every untouched row is shifted by the net length
+ *  change of the applied edits BEFORE it, and then re-verified against the new draft: a row that
+ *  no longer reads the same at its new offset is dropped, not offered. Same rule as
+ *  `foldReplacements` — a suggestion is only ever shown while its span is provably its word. */
+export function survivorsAfterApply(rows, applied, nextText) {
+  if (!Array.isArray(rows) || !Array.isArray(applied) || typeof nextText !== 'string') {
+    return []
+  }
+
+  const picks = applied.filter(
+    item =>
+      item &&
+      Number.isInteger(item.start) &&
+      Number.isInteger(item.end) &&
+      item.end > item.start &&
+      replacementOf(item) !== null
+  )
+
+  const out = []
+
+  for (const row of rows) {
+    if (!row || !Number.isInteger(row.start) || !Number.isInteger(row.end) || row.end <= row.start) {
+      continue
+    }
+
+    // The applied row itself overlaps, and so does any row sharing that region.
+    if (picks.some(pick => pick.start < row.end && row.start < pick.end)) {
+      continue
+    }
+
+    const shift = picks.reduce(
+      (total, pick) =>
+        pick.start < row.start ? total + replacementOf(pick).length - (pick.end - pick.start) : total,
+      0
+    )
+    const start = row.start + shift
+    const end = row.end + shift
+
+    if (nextText.slice(start, end) !== row.text) {
+      continue
+    }
+
+    out.push({ ...row, start, end })
+  }
+
+  return out
+}
+
+/** The strip's count line. `checking` is a suffix rather than a replacement: the rows underneath
+ *  are still the ones the user is reading, they are just being reconfirmed. */
+export function countLabel({ count = 0, truncated = false, checking = false }) {
+  const base = `${count} ${count === 1 ? 'suggestion' : 'suggestions'}`
+
+  return `${base}${truncated ? ' · partial' : ''}${checking ? ' · checking…' : ''}`
+}
+
 /** `api-transport` shapes a non-2xx as `Error("<status>: <raw body>")`. Only the
  *  message survives the `ipcRenderer.invoke` rejection (structured clone keeps
  *  name/message/stack and drops `statusCode`), so the prefix is the status. Our
@@ -371,9 +440,10 @@ export function describeError(err) {
 
   // A 404 on this prefix is never ours — the backend only answers 400, 413 and 503 — so it is
   // FastAPI's route miss, whose body is `{"detail":"Not Found"}`. That generic string carries
-  // no information and must not outrank the explanation a user can act on.
+  // no information and must not outrank the explanation a user can act on. During startup it
+  // can also mean the request reached the primary profile before the active profile was ready.
   if (httpStatus(err) === 404) {
-    return 'Backend not mounted — enable harper-grammar-coach on the gateway.'
+    return 'Harper API is not available on the current backend. Check the active profile and plugin settings.'
   }
 
   if (detail?.message) {
@@ -387,6 +457,48 @@ export function describeError(err) {
   }
 
   return 'unknown error'
+}
+
+/** Startup failures that can resolve without changing Harper configuration.
+ *  A 404 is transient here because ctx.rest may still be scoped to Hermes'
+ *  primary profile; repeated failure is surfaced after the bounded retry budget. */
+function isTransientWarmFailure(err) {
+  const reason = errorReason(err)
+  const status = httpStatus(err)
+  const message = err && typeof err.message === 'string' ? err.message : ''
+
+  if (reason === 'not-mounted' || isTimeoutError(err) || RECOVERABLE_REASONS.has(reason)) {
+    return true
+  }
+
+  // A transport failure has no HTTP status. Do not retry arbitrary programming errors.
+  if (status === 0 && /network|fetch|connect|socket|econn|backend unavailable/i.test(message)) {
+    return true
+  }
+
+  // An unclassified server failure may be a backend still starting. Explicit
+  // Harper engine/configuration reasons remain terminal unless listed above.
+  return status >= 500 && !reason
+}
+
+function exhaustedWarmMessage(err) {
+  if (errorReason(err) === 'not-mounted') {
+    return 'Harper could not reach the API for the active profile after startup retries. Check that the Agent plugin is enabled, then press Retry.'
+  }
+
+  return `Harper backend is still unavailable after startup retries. ${describeError(err)} Press Retry to try again.`
+}
+
+async function configuredCorrectOnSend(fallback = false) {
+  try {
+    const result = await host.request('plugins.manage', { action: 'list' })
+    const plugin = result?.plugins?.find(row => row?.key === ID || row?.name === ID)
+    const field = plugin?.settings_schema?.find(row => row?.key === 'correct_on_send')
+
+    return typeof field?.value === 'boolean' ? field.value : fallback
+  } catch {
+    return fallback
+  }
 }
 
 /** Never log draft text. Shape and counts only, matching the app's own
@@ -423,10 +535,37 @@ const $expanded = atom(false)
 const $dismissed = atom(null)
 /** Count of mounted underside surfaces (main composer + any tiles/HUD). */
 const $surfaces = atom(0)
+const $suggestionsOpen = atom(false)
+/** Last set the user closed; an identical recheck remains dismissed. */
+const $dismissedSuggestionSet = atom(null)
+// Radix normally focuses the first popover item on open and dismisses when
+// focus moves to the composer. Auto-open is visual-only; row application is
+// the one deliberate outside-focus transition that must keep the popover up.
+const $autoOpened = atom(false)
+const $applyingSuggestion = atom(false)
+
+function suggestionSetKey(items) {
+  const parts = items.map(item => [
+    String(item?.code ?? ''),
+    String(item?.category ?? ''),
+    String(item?.text ?? ''),
+    String(replacementOf(item) ?? '')
+  ])
+  parts.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+  return JSON.stringify(parts)
+}
+
+function closeSuggestionsPopover() {
+  const check = $check.get()
+  const items = visibleItems(check.suggestions, $ignored.get(), check.text)
+  $dismissedSuggestionSet.set(items.length ? suggestionSetKey(items) : null)
+  $suggestionsOpen.set(false)
+  $autoOpened.set(false)
+}
 
 // --- engine ------------------------------------------------------------------
 
-function createEngine(ctx) {
+export function createEngine(ctx) {
   let generation = 0
   let dueAt = 0
   let lastSeen = null
@@ -435,9 +574,9 @@ function createEngine(ctx) {
   let inFlight = false
   let reading = false
   let disposed = false
-  /** Sticky after a transport-level failure (404 / unreachable) so a user with
-   *  no backend does not get a doomed request every debounce for the rest of
-   *  the session. Cleared by an explicit Retry, a restart, or a success. */
+  /** Sticky after warm recovery is exhausted so a user with no backend does
+   *  not get a doomed request every debounce for the rest of the session.
+   *  Cleared by an explicit Retry, a restart, or a successful request. */
   let backendDown = false
   let offlineShown = false
   /** True until the load-time `/warm` settles. Harper's dictionary load was
@@ -445,10 +584,45 @@ function createEngine(ctx) {
    *  and burns its whole ceiling for nothing, so the tick holds off. Cleared on
    *  both outcomes — a failed warm must not mute checking for the session. */
   let warming = true
+  let warmPromise = null
+  let warmRetryCancel = null
+  let warmRetryIndex = 0
+  let warmStarted = false
+  let warmAttemptNumber = 0
+  let warmStartedAt = 0
+  let warmReadyAt = 0
+  let suppressAutoOpenText = null
+  let applyFocusGuardTimer = null
 
   const publish = next => {
     if (!disposed) {
       $check.set(next)
+
+      if (next.state === 'checking') {
+        if (!visibleItems(next.suggestions, $ignored.get(), next.text).length) {
+          $suggestionsOpen.set(false)
+        }
+        return
+      }
+
+      const items = visibleItems(next.suggestions, $ignored.get(), next.text)
+
+      if (!items.length) {
+        $suggestionsOpen.set(false)
+        $dismissedSuggestionSet.set(null)
+        if (next.text === suppressAutoOpenText) suppressAutoOpenText = null
+        return
+      }
+
+      const key = suggestionSetKey(items)
+
+      if (next.text === suppressAutoOpenText) {
+        if (!$suggestionsOpen.get()) $dismissedSuggestionSet.set(key)
+        suppressAutoOpenText = null
+      } else if ($dismissedSuggestionSet.get() !== key) {
+        $autoOpened.set(true)
+        $suggestionsOpen.set(true)
+      }
     }
   }
 
@@ -517,7 +691,8 @@ function createEngine(ctx) {
         chars: text.length,
         suggestions: suggestions.length,
         truncated,
-        engineMs: payload?.engineMs
+        engineMs: payload?.engineMs,
+        sinceWarmMs: warmReadyAt ? Math.round(performance.now() - warmReadyAt) : undefined
       })
       publish(
         suggestions.length
@@ -625,6 +800,7 @@ function createEngine(ctx) {
     // A new draft supersedes anything in flight and restarts the debounce.
     lastSeen = text
     generation += 1
+    if (text !== suppressAutoOpenText) suppressAutoOpenText = null
     dueAt = Date.now() + debounceMs(settings.debounce)
     publish({ state: 'checking', text, suggestions: keepRows() })
   }
@@ -661,7 +837,7 @@ function createEngine(ctx) {
     checkedResult = null
   }
 
-  const applyItems = async items => {
+  const applyItems = async (items, { focus = true } = {}) => {
     const picks = dropOverlaps(items)
 
     if (!picks.length) {
@@ -685,20 +861,41 @@ function createEngine(ctx) {
       return { applied: 0, reason: 'stale' }
     }
 
+    // Hermes' supported setDraft path also requests composer focus. Arm the
+    // popover guard BEFORE the write; waiting until setDraft resolves misses
+    // that focus request's React effect.
+    if (focus) $applyingSuggestion.set(true)
     const wrote = await host.composer.setDraft(null, folded.text).catch(() => false)
 
     if (!wrote) {
+      if (focus) $applyingSuggestion.set(false)
       return { applied: 0, reason: 'no-surface' }
     }
 
-    // The write path already parked the caret at the end; this just returns
-    // focus to the composer so typing resumes without a click.
-    host.composer.focus(null)
+    // setDraft's official paint path parks the caret at the end and requests
+    // composer focus. Keep outside-focus dismissal suppressed briefly while
+    // its state update/effect runs. Pointer outside and Escape remain normal.
+    if (focus) {
+      if (applyFocusGuardTimer !== null) clearTimeout(applyFocusGuardTimer)
+      applyFocusGuardTimer = setTimeout(() => {
+        applyFocusGuardTimer = null
+        $applyingSuggestion.set(false)
+      }, 300)
+    }
     invalidate()
     lastSeen = null
     dueAt = Date.now()
     $dismissed.set(null)
-    publish({ state: 'checking', text: folded.text, suggestions: [] })
+    suppressAutoOpenText = folded.text
+    // Hold the rows that are still true of the NEW draft, at their new offsets, while the
+    // recheck runs. Collapsing to an empty list here is what made every click flicker; the
+    // re-verification inside `survivorsAfterApply` is what keeps a stale row from being
+    // offered against text it no longer describes.
+    publish({
+      state: 'checking',
+      text: folded.text,
+      suggestions: survivorsAfterApply($check.get().suggestions, picks, folded.text)
+    })
 
     return { applied: folded.applied }
   }
@@ -708,6 +905,11 @@ function createEngine(ctx) {
 
     next.add(ignoreKey(item, $check.get().text))
     $ignored.set(next)
+    const check = $check.get()
+    if (!visibleItems(check.suggestions, next, check.text).length) {
+      $suggestionsOpen.set(false)
+      $dismissedSuggestionSet.set(null)
+    }
   }
 
   const adopt = payload => {
@@ -728,10 +930,10 @@ function createEngine(ctx) {
 
   /** Start + pre-warm the dictionary (~2 s once) so the user's first real
    *  check costs 6 ms, not 2026 ms. Failures are DATA here, not HTTP errors. */
-  const warm = async () => {
-    if (disposed) {
-      return
-    }
+  const attemptWarm = async () => {
+    if (disposed) return false
+    warmAttemptNumber += 1
+    if (!warmStartedAt) warmStartedAt = performance.now()
 
     // The stored dialect goes up BEFORE the start, not after: harper-ls reads it
     // from the workspace/configuration answer it only asks for during startup, so
@@ -758,22 +960,77 @@ function createEngine(ctx) {
       if (payload && payload.ok === false) {
         // "Cannot start" is durable — the tick must not fire a doomed check
         // every debounce until the user installs, restarts, or retries.
+        const reason = payload.reason || ''
+        const error = new Error(payload.message || reason || 'Harper engine offline')
+        error.reason = reason
         backendDown = true
         offlineShown = true
-        publishOffline(payload.reason || 'Harper engine offline')
+        return { ok: false, error, transient: RECOVERABLE_REASONS.has(reason) }
       } else {
         backendDown = false
         offlineShown = false
-        log('warm', { state: payload?.state, warmupMs: payload?.warmupMs })
+        warmRetryIndex = 0
+        lastSeen = null
+        dueAt = 0
+        warmReadyAt = performance.now()
+        log('warm', {
+          state: payload?.state,
+          warmupMs: payload?.warmupMs,
+          attempt: warmAttemptNumber,
+          sinceStartupMs: Math.round(warmReadyAt - warmStartedAt)
+        })
+        return { ok: true }
       }
     } catch (err) {
-      backendDown = errorReason(err) === 'not-mounted'
+      backendDown = true
       offlineShown = true
-      publishOffline(describeError(err))
       log('warm failed', describeError(err))
+      return { ok: false, error: err, transient: isTransientWarmFailure(err) }
     } finally {
       warming = false
     }
+  }
+
+  const warm = async () => {
+    if (disposed) return false
+    if (warmPromise) return warmPromise
+    if (warmRetryCancel) {
+      warmRetryCancel()
+      warmRetryCancel = null
+    }
+
+    warmStarted = true
+    warming = true
+    publish({ state: 'starting', text: '', suggestions: [] })
+    const run = async () => {
+      const result = await attemptWarm()
+      if (disposed) return false
+      if (result.ok) {
+        backendDown = false
+        offlineShown = false
+        warmRetryIndex = 0
+        return true
+      }
+      if (result.transient && warmRetryIndex < WARM_RETRY_DELAYS_MS.length) {
+        const delay = WARM_RETRY_DELAYS_MS[warmRetryIndex++]
+        warming = true
+        backendDown = false
+        log('warm retry scheduled', { attempt: warmAttemptNumber, delayMs: delay })
+        publish({ state: 'starting', text: '', suggestions: [], reason: `Retrying in ${Math.ceil(delay / 1000)}s` })
+        const scheduled = ctx.setTimeout(() => {
+          warmRetryCancel = null
+          void warm()
+        }, delay)
+        warmRetryCancel = typeof scheduled === 'function' ? scheduled : () => clearTimeout(scheduled)
+        return false
+      }
+      backendDown = true
+      offlineShown = true
+      publishOffline(result.transient ? exhaustedWarmMessage(result.error) : describeError(result.error))
+      return false
+    }
+    warmPromise = run().finally(() => { warmPromise = null })
+    return warmPromise
   }
 
   const refreshStatus = async () => {
@@ -837,6 +1094,10 @@ function createEngine(ctx) {
 
   /** Force a check of the current draft right now (palette / Retry). */
   const recheck = async () => {
+    if (warmStarted && (warming || backendDown)) {
+      const ready = await warm()
+      if (!ready) return
+    }
     backendDown = false
     offlineShown = false
     const draft = await host.composer.getDraft(null).catch(() => null)
@@ -863,6 +1124,11 @@ function createEngine(ctx) {
   const dispose = () => {
     disposed = true
     generation += 1
+    if (applyFocusGuardTimer !== null) clearTimeout(applyFocusGuardTimer)
+    applyFocusGuardTimer = null
+    $applyingSuggestion.set(false)
+    if (warmRetryCancel) warmRetryCancel()
+    warmRetryCancel = null
   }
 
   return {
@@ -881,6 +1147,12 @@ function createEngine(ctx) {
     dispose,
     get backendDown() {
       return backendDown
+    },
+    get warming() {
+      return warming
+    },
+    get checkState() {
+      return $check.get()
     }
   }
 }
@@ -907,10 +1179,15 @@ function visibleItems(suggestions, ignored, text) {
   return (Array.isArray(suggestions) ? suggestions : []).filter(item => !ignored.has(ignoreKey(item, text)))
 }
 
-function SuggestionRow({ item, engine }) {
+/** The whole row is the apply control: the reading itself is the target, so a click
+ *  never has to hunt for a button. The ignore icon stays a separate surface — its own
+ *  click is stopped before it reaches the row, and a keydown that bubbled up from a
+ *  focused child is not an activation of the row. */
+export function SuggestionRow({ item, engine }) {
   const replacement = replacementOf(item)
   const category = String(item.category ?? 'grammar')
   const label = category === 'spelling' ? 'Spelling' : category === 'capitalisation' ? 'Capitalisation' : 'Grammar'
+  const changeLabel = `Apply correction: Change '${item.text}' to '${replacement}'`
 
   const onApply = async () => {
     const result = await engine.applyItems([item])
@@ -924,30 +1201,35 @@ function SuggestionRow({ item, engine }) {
 
   return jsxs('div', {
     className: 'hgc-item',
-    title: item.message || '',
     children: [
-      jsx('span', { className: 'hgc-bad', children: item.text }),
-      jsx('span', { className: 'hgc-arrow', children: jsx(icons.ChevronRight, { className: 'hgc-ico' }) }),
-      jsx('span', { className: 'hgc-good', children: replacement }),
-      jsx('span', { className: 'hgc-spacer' }),
-      jsx('span', { className: 'hgc-meta', children: `${label} · ${confidenceLabel(item.priority)}` }),
       jsx(Button, {
         variant: 'ghost',
         size: 'micro',
-        onClick: onApply,
-        children: 'Apply'
+        className: 'hgc-apply-row',
+        'aria-label': changeLabel,
+        onClick: () => void onApply(),
+        children: jsxs('span', { className: 'hgc-row-content', children: [
+          jsx('span', { className: 'hgc-bad', children: item.text }),
+          jsx('span', { className: 'hgc-arrow', children: jsx(icons.ChevronRight, { className: 'hgc-ico' }) }),
+          jsx('span', { className: 'hgc-good', children: replacement }),
+          jsx('span', { className: 'hgc-spacer' }),
+          jsx('span', { className: 'hgc-meta', children: `${label} · ${confidenceLabel(item.priority)}` })
+        ]})
       }),
       jsx(Button, {
         variant: 'ghost',
         size: 'micro',
         title: 'Ignore this rule for this text until the draft changes',
-        onClick: () => engine.ignore(item),
+        'aria-label': 'Ignore this suggestion',
+        onClick: event => {
+          event.stopPropagation()
+          engine.ignore(item)
+        },
         children: jsx(icons.EyeOff, { className: 'hgc-ico' })
       })
     ]
   })
 }
-
 function SuggestionList({ suggestions, engine, ignored, text }) {
   const items = visibleItems(suggestions, ignored, text)
   const shown = items.slice(0, MAX_ROWS)
@@ -967,15 +1249,69 @@ function SuggestionList({ suggestions, engine, ignored, text }) {
   })
 }
 
+function ApplyAllButton({ items, engine, onApplied }) {
+  const run = async () => {
+    const result = await engine.applyItems(items)
+    if (result.applied > 0) onApplied?.(result)
+    else if (result.reason === 'stale') host.notify({ kind: 'warning', message: 'Draft changed — re-checking before applying.' })
+    else if (result.reason === 'no-surface') host.notify({ kind: 'warning', message: 'No open composer to update.' })
+  }
+  return jsx(Button, { variant: 'secondary', size: 'micro', onClick: () => void run(), children: 'Apply all' })
+}
+
+function ComposerPopover({ engine }) {
+  const surfaces = useValue($surfaces)
+  const settings = useValue($settings)
+  const check = useValue($check)
+  const ignored = useValue($ignored)
+  const open = useValue($suggestionsOpen)
+  const items = visibleItems(check.suggestions, ignored, check.text)
+  if (surfaces !== 1 || settings.suggestionDisplay !== 'popover' || !items.length) return null
+
+  return jsxs(Popover, {
+      open,
+    onOpenChange: next => {
+      if (next) {
+        $autoOpened.set(false)
+        $suggestionsOpen.set(true)
+      } else closeSuggestionsPopover()
+    },
+    children: [
+      jsx(PopoverTrigger, {
+        asChild: true,
+        children: jsx(Button, {
+          variant: 'ghost', size: 'micro',
+          'aria-label': `Harper, ${items.length} suggestions`,
+          title: 'Open Harper suggestions',
+          children: `Harper · ${items.length}`
+        })
+      }, 'trigger'),
+      jsx(PopoverContent, {
+        side: 'top', align: 'start', className: 'hgc-pop',
+        onOpenAutoFocus: event => { if ($autoOpened.get()) event.preventDefault() },
+        onFocusOutside: event => { if ($applyingSuggestion.get()) event.preventDefault() },
+        children: jsxs('div', { className: 'hgc-pop-body', children: [
+          jsxs('div', { className: 'hgc-row', children: [
+            jsx('span', { className: 'hgc-h', children: `${items.length} suggestions` }),
+            jsx('span', { className: 'hgc-spacer' }),
+            jsx(ApplyAllButton, { items, engine })
+          ]}),
+          jsx(SuggestionList, { suggestions: check.suggestions, engine, ignored, text: check.text })
+        ]})
+      }, 'content')
+    ]
+  })
+}
 function ComposerStrip({ engine }) {
   const surfaces = useSurfaceCount()
+  const settings = useValue($settings)
   const check = useValue($check)
   const expanded = useValue($expanded)
   const ignored = useValue($ignored)
   const dismissedText = useValue($dismissed)
 
   // Hooks above are unconditional; only now may we bail out.
-  if (surfaces !== 1) {
+  if (surfaces !== 1 || settings.suggestionDisplay !== 'underside') {
     return null
   }
 
@@ -987,6 +1323,19 @@ function ComposerStrip({ engine }) {
 
   if (check.state === 'idle' || check.state === 'clean') {
     return null
+  }
+
+  if (check.state === 'starting') {
+    return jsx('div', {
+      className: 'hgc-strip',
+      children: jsx('div', {
+        className: 'hgc-row',
+        children: jsxs('span', {
+          className: 'hgc-count',
+          children: [jsx(GlyphSpinner, { className: 'hgc-spin' }), 'Harper · starting…']
+        })
+      })
+    })
   }
 
   if (check.state === 'too-long') {
@@ -1088,9 +1437,7 @@ function ComposerStrip({ engine }) {
           jsx('span', {
             className: 'hgc-count',
             title: check.truncated ? TRUNCATED_HINT : undefined,
-            children: `${items.length} ${items.length === 1 ? 'suggestion' : 'suggestions'}${
-              check.truncated ? ' · partial' : ''
-            }`
+            children: countLabel({ count: items.length, truncated: check.truncated, checking })
           }),
           jsx('span', { className: 'hgc-spacer' }),
           items.length > 1
@@ -1110,103 +1457,72 @@ function ComposerStrip({ engine }) {
   })
 }
 
-/** Statusbar chip: only appears when there is something to say. It is also the
- *  home for the suggestion list when several composers are mounted at once and
- *  the inline strip has bowed out. */
+/** Compact runtime indicator. It carries suggestions only when the composer
+ *  action is unavailable or multiple composer surfaces are mounted. */
 function StatusChip({ engine }) {
   const check = useValue($check)
   const engineState = useValue($engine)
   const ignored = useValue($ignored)
+  const surfaces = useValue($surfaces)
+  const settings = useValue($settings)
+  const suggestionsOpen = useValue($suggestionsOpen)
   const [open, setOpen] = useState(false)
-
   const items = visibleItems(check.suggestions, ignored, check.text)
-  const notable =
-    check.state === 'offline' ||
-    check.state === 'error' ||
-    check.state === 'too-long' ||
-    (check.state === 'suggestions' && items.length > 0)
+  const fallback = surfaces !== 1
+  const showSuggestions = fallback && items.length > 0
+  const popoverOpen = showSuggestions ? suggestionsOpen : open
+  const issue = ['starting', 'offline', 'error', 'too-long'].includes(check.state)
+  const popover = showSuggestions || issue
+  const label = check.state === 'starting' ? 'Starting' : check.state === 'offline' || check.state === 'error' ? 'Unavailable' : check.state === 'too-long' ? 'Too long' : showSuggestions ? `${items.length} suggestions` : 'Ready'
+  const caption = showSuggestions ? `Harper · ${items.length}` : `Harper · ${label}`
 
-  if (!notable) {
-    return null
-  }
+  const trigger = jsx(Button, {
+    variant: 'ghost', size: 'micro',
+    'aria-label': showSuggestions ? `Harper, ${items.length} suggestions` : `Harper status: ${label}`,
+    title: check.truncated ? TRUNCATED_HINT : 'Harper Grammar Coach',
+    children: jsxs('span', { className: 'hgc-status', children: [
+      jsx(check.state === 'offline' || check.state === 'error' ? icons.AlertTriangle : icons.CircleLetterA, { className: 'hgc-ico' }),
+      jsx(Badge, { variant: issue ? 'warn' : 'muted', size: 'xs', children: caption })
+    ]})
+  })
 
-  const tone = check.state === 'offline' || check.state === 'error' ? 'warn' : 'muted'
-  const caption =
-    check.state === 'offline' || check.state === 'error'
-      ? 'Harper'
-      : check.state === 'too-long'
-        ? 'Too long'
-        : `${items.length}`
+  if (!popover) return jsx('span', {
+    className: 'hgc-status-static',
+    children: jsxs('span', { className: 'hgc-status', children: [
+      jsx(icons.CircleLetterA, { className: 'hgc-ico' }),
+      jsx(Badge, { variant: 'muted', size: 'xs', children: caption })
+    ]})
+  })
 
   return jsxs(Popover, {
-    open,
+    open: popoverOpen,
     onOpenChange: next => {
-      setOpen(next)
-
-      if (next) {
-        void engine.refreshStatus()
-      }
+      if (showSuggestions) next ? $suggestionsOpen.set(true) : closeSuggestionsPopover()
+      else setOpen(next)
+      if (next) void engine.refreshStatus()
     },
     children: [
-      jsx(
-        PopoverTrigger,
-        {
-          asChild: true,
-          children: jsxs(Button, {
-            variant: 'ghost',
-            size: 'micro',
-            title: check.truncated ? TRUNCATED_HINT : 'Harper Grammar Coach',
-            children: [
-              jsx(check.state === 'offline' || check.state === 'error' ? icons.AlertTriangle : icons.CircleLetterA, {
-                className: 'hgc-ico'
-              }),
-              jsx(Badge, { variant: tone, size: 'xs', children: caption })
-            ]
-          })
-        },
-        'trigger'
-      ),
-      jsx(
-        PopoverContent,
-        {
-          side: 'top',
-          align: 'end',
-          className: 'hgc-pop',
-          children: jsxs('div', {
-            className: 'hgc-pop-body',
-            children: [
-              jsxs('div', {
-                className: 'hgc-row',
-                children: [
-                  jsx('span', { className: 'hgc-h', children: 'Harper Grammar Coach' }),
-                  jsx('span', { className: 'hgc-spacer' }),
-                  jsx('span', {
-                    className: 'hgc-sub',
-                    children: `${engineState.state}${engineState.version ? ` · v${engineState.version}` : ''}`
-                  })
-                ]
-              }),
-              check.state === 'offline' || check.state === 'error'
-                ? jsxs('div', {
-                    className: 'hgc-note',
-                    children: [
-                      check.reason || 'Harper unavailable',
-                      jsx('span', { className: 'hgc-spacer' }),
-                      jsx(Button, { variant: 'ghost', size: 'micro', onClick: () => void engine.recheck(), children: 'Retry' })
-                    ]
-                  })
-                : check.state === 'too-long'
-                  ? jsx('div', { className: 'hgc-note', children: 'Draft too long to check.' })
-                  : jsx(SuggestionList, { suggestions: check.suggestions, engine, ignored, text: check.text })
-            ]
-          })
-        },
-        'content'
-      )
+      jsx(PopoverTrigger, { asChild: true, children: trigger }, 'trigger'),
+      jsx(PopoverContent, {
+        side: 'top', align: 'end', className: 'hgc-pop',
+        children: jsxs('div', { className: 'hgc-pop-body', children: [
+          jsxs('div', { className: 'hgc-row', children: [
+            jsx('span', { className: 'hgc-h', children: 'Harper Grammar Coach' }),
+            jsx('span', { className: 'hgc-spacer' }),
+            jsx('span', { className: 'hgc-sub', children: `${engineState.state}${engineState.version ? ` · v${engineState.version}` : ''}` })
+          ]}),
+          issue ? jsx('div', { className: 'hgc-note', children: check.reason || (check.state === 'too-long' ? 'Draft too long to check.' : 'Harper is recovering.') }) : null,
+          issue && check.state !== 'too-long' ? jsx(Button, { variant: 'ghost', size: 'micro', onClick: () => void engine.recheck(), children: 'Retry' }) : null,
+          showSuggestions ? jsxs('div', { children: [
+            jsx(ApplyAllButton, { items, engine }),
+            jsx(SuggestionList, { suggestions: check.suggestions, engine, ignored, text: check.text })
+          ]}) : null,
+          !showSuggestions && !issue ? jsx('div', { className: 'hgc-note', children: `${settings.live ? 'Live checking enabled' : 'Live checking disabled'}${check.state === 'checking' ? ' · Checking draft…' : ''}` }) : null
+        ]})
+      }, 'content')
     ]
   })
 }
-
 function SettingsPanel({ ctx, engine }) {
   const settings = useValue($settings)
   const engineState = useValue($engine)
@@ -1255,21 +1571,30 @@ function SettingsPanel({ ctx, engine }) {
         below: jsx('div', {
           className: 'hgc-note',
           children:
-            'Applying a suggestion moves the caret to the end of the draft. The composer has no caret-restore seam, so the strip is advisory while you type; the only automation is at send time, where the draft clears anyway.'
+            'Applying a suggestion moves the caret to the end of the draft. Live suggestions are advisory while you type. Send-time changes are optional and off by default.'
         })
       }),
       jsx(ToggleRow, {
         checked: settings.live,
         label: 'Check while typing',
-        description: 'Shows suggestions under the composer after a pause. Never edits your draft.',
+        description: 'Checks the draft after a pause. Never edits your draft.',
         onChange: checked => save({ live: checked })
       }),
-      jsx(ToggleRow, {
-        checked: settings.correctOnSend,
-        label: 'Correct high-confidence issues on send',
-        description:
-          'Fixes the enabled categories the moment you press Enter, then sends. Anything else — and any timeout — sends your text unchanged.',
-        onChange: checked => save({ correctOnSend: checked })
+      jsx(ListRow, {
+        title: 'Suggestion display',
+        description: 'Choose where Harper suggestions appear.',
+        action: jsx(SegmentedControl, {
+          options: [
+            { id: 'popover', label: 'Composer popover' },
+            { id: 'underside', label: 'Underside list' }
+          ],
+          value: settings.suggestionDisplay,
+          onChange: value => save({ suggestionDisplay: value })
+        })
+      }),
+      jsx(ListRow, {
+        title: 'Correct on send',
+        description: 'Configure this persisted option in the Harper plugin settings gear. It is off by default.'
       }),
       ...CATEGORIES.map(category =>
         jsx(
@@ -1361,8 +1686,9 @@ const CSS = `
 .hgc-ico { width: 12px; height: 12px; flex: 0 0 auto; }
 .hgc-spin { flex: 0 0 auto; font-size: 11px; line-height: 14px; color: var(--ui-text-secondary); }
 .hgc-list { display: flex; flex-direction: column; gap: 1px; margin-top: 2px; }
-.hgc-item { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 1px 4px; border-radius: 3px; }
-.hgc-item:hover { background: var(--chrome-action-hover); }
+.hgc-item { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 1px 2px; border-radius: 3px; }
+.hgc-apply-row { flex: 1 1 auto; min-width: 0; justify-content: flex-start; text-align: left; }
+.hgc-row-content { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; }
 .hgc-bad { flex: 0 1 auto; max-width: 34%; font-size: 11px; color: var(--ui-text-secondary); text-decoration: line-through; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hgc-arrow { flex: 0 0 auto; display: inline-flex; color: var(--ui-text-secondary); }
 .hgc-good { flex: 0 1 auto; max-width: 34%; font-size: 11px; font-weight: 500; color: var(--ui-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1372,6 +1698,8 @@ const CSS = `
 .hgc-pop-body { display: flex; flex-direction: column; gap: 6px; }
 .hgc-h { font-size: 12px; font-weight: 600; color: var(--ui-text-primary); white-space: nowrap; }
 .hgc-sub { font-size: 11px; color: var(--ui-text-secondary); white-space: nowrap; }
+.hgc-status { display: inline-flex; align-items: center; gap: 4px; }
+.hgc-status-static { display: inline-flex; align-items: center; }
 .hgc-settings { display: flex; flex-direction: column; }
 `
 
@@ -1380,16 +1708,23 @@ const CSS = `
 export default {
   id: ID,
   name: 'Harper Grammar Coach',
-  description: 'Offline grammar + spelling coaching for the chat composer, with a suggestion strip and send-time fixes.',
+  description: 'Offline grammar + spelling coaching for the chat composer, with a suggestion popover and optional send-time fixes.',
   // Opt-in: it spawns a subprocess and rewrites text at send time.
   defaultEnabled: false,
 
   register(ctx) {
     $settings.set(normalizeSettings(ctx.storage.get('settings', null)))
+    void configuredCorrectOnSend($settings.get().correctOnSend).then(value => {
+      $settings.set(normalizeSettings({ ...$settings.get(), correctOnSend: value }))
+    })
     $ignored.set(new Set())
     $expanded.set(false)
     $dismissed.set(null)
     $surfaces.set(0)
+    $suggestionsOpen.set(false)
+    $autoOpened.set(false)
+    $applyingSuggestion.set(false)
+    $dismissedSuggestionSet.set(null)
     $check.set(IDLE_CHECK)
 
     const style = document.createElement('style')
@@ -1434,6 +1769,12 @@ export default {
 
     ctx.registerMany([
       {
+        id: 'composer-suggestions',
+        area: COMPOSER_AREAS.actions,
+        order: 40,
+        render: () => jsx(ComposerPopover, { engine })
+      },
+      {
         id: 'strip',
         area: COMPOSER_AREAS.underside,
         order: 40,
@@ -1459,7 +1800,8 @@ export default {
         order: 80,
         data: {
           handler: async draft => {
-            const settings = $settings.get()
+            const configured = await configuredCorrectOnSend($settings.get().correctOnSend)
+            const settings = { ...$settings.get(), correctOnSend: configured }
 
             if (!settings.correctOnSend || !draft || typeof draft.text !== 'string') {
               return draft
@@ -1489,7 +1831,12 @@ export default {
               return draft
             }
 
-            const picks = pickForAutoFix(payload.suggestions, settings)
+            // Reuse the exact draft-scoped dismissal identity shown by the live
+            // renderer. A submit-time check must not resurrect an ignored rule.
+            const ignored = $ignored.get()
+            const picks = pickForAutoFix(payload.suggestions, settings).filter(
+              item => !ignored.has(ignoreKey(item, text))
+            )
 
             if (!picks.length) {
               return draft
@@ -1530,10 +1877,46 @@ export default {
         area: PALETTE_AREA,
         order: 41,
         data: {
-          id: 'apply-all',
+          id: 'harper.applyAll',
+          action: 'harper.applyAll',
           label: 'Harper: Apply all suggestions',
           icon: icons.Check,
           keywords: ['grammar', 'spelling', 'harper', 'fix'],
+          run: () => void applyAllFromCurrent()
+        }
+      },
+      {
+        id: 'open-suggestions',
+        area: PALETTE_AREA,
+        order: 40,
+        data: {
+          id: 'harper.openSuggestions',
+          action: 'harper.openSuggestions',
+          label: 'Harper: Open suggestions',
+          icon: icons.Search,
+          keywords: ['grammar', 'spelling', 'harper', 'suggestions'],
+          run: () => $suggestionsOpen.set(true)
+        }
+      },
+      {
+        id: 'open-suggestions',
+        area: KEYBINDS_AREA,
+        data: {
+          id: 'harper.openSuggestions',
+          category: 'view',
+          defaults: ['mod+alt+h'],
+          label: 'Harper: Open suggestions',
+          run: () => $suggestionsOpen.set(true)
+        }
+      },
+      {
+        id: 'apply-all-keybind',
+        area: KEYBINDS_AREA,
+        data: {
+          id: 'harper.applyAll',
+          category: 'view',
+          defaults: ['mod+alt+shift+h'],
+          label: 'Harper: Apply all suggestions',
           run: () => void applyAllFromCurrent()
         }
       },

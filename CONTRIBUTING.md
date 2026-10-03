@@ -9,8 +9,11 @@ harper_ls.py              THE ENGINE PIN: version, per-platform asset allowlist 
                           resolution order, extraction, download
 dashboard/manifest.json   dashboard surface; "api" points at plugin_api.py
 dashboard/plugin_api.py   the LSP engine + the mounted HTTP routes
+technical_spans.py        which spans of a draft are machine text, from context alone
 desktop/plugin.js         the renderer half: composer strip and settings section
 tests/                    pytest; no network, no real harper-ls
+tests/renderer/           node:test for the renderer's pure helpers + one jsdom mount test
+package.json              dev-only: the JS test harness. The plugin imports no dependency.
 scripts/fetch_harper_ls.py  contributor/CI helper; same code path as POST /bootstrap
 scripts/report_hermes_validation.py  makes `hermes plugins validate --json` legible in a log
 .github/workflows/        ci.yml and hermes-validate.yml
@@ -25,11 +28,9 @@ a dashboard question.
 
 Three rules fall out of that layout and are worth internalizing before you change anything:
 
-1. **No binary in the repository, ever.** A ~60 MB executable in a plugin tree makes Hermes'
-   security scanner return a `caution` verdict (bundled binaries are warn-tier by design),
-   which means the package cannot be installed without `--force` — and not installed at all
-   from a non-interactive context, which includes the Desktop "Install from Git" dialog.
-   `vendor/` is gitignored for that reason. Do not "temporarily" commit one to debug.
+1. **No binary in the repository, ever.** The language server is a large, platform-specific
+   executable. Users fetch the pinned release asset on demand through the plugin's checked
+   bootstrap path. `vendor/` is gitignored; do not commit a local engine binary.
 2. **Release facts live in exactly one place: `harper_ls.py`.** `plugin_api.py` must not
    learn a version string, an asset name or a URL. If you find yourself hardcoding `2.12.0`
    somewhere outside that module, that is the bug.
@@ -40,42 +41,59 @@ Three rules fall out of that layout and are worth internalizing before you chang
 
 Python 3.11+. The plugin has **no runtime dependencies of its own** — FastAPI and pydantic
 are already present in the Hermes process that mounts it, which is also why `plugin.yaml`
-declares `python_runtime: external`. For development you need pytest, ruff, and a FastAPI
-to import against:
+declares `python_runtime: external`. Development, renderer validation, and Hermes validation
+dependencies are listed in the `dev` extra and pinned by `uv.lock`:
 
 ```bash
-python -m venv .venv && .venv/Scripts/activate            # Windows; bin/ elsewhere
-pip install -e '.[dev]' fastapi httpx
+uv sync --locked --extra dev
 ```
 
-Or with no environment at all, if you have [uv](https://docs.astral.sh/uv/):
+Activate the environment after syncing:
 
 ```bash
-uv run --with pytest,fastapi,httpx pytest
-uvx ruff check .
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
 ```
+
+The renderer tests need Node 22+ (they use the built-in `node:test` runner with a glob
+argument). Nothing in the shipped plugin depends on it: `npm ci` installs jsdom, react and
+react-dom as **devDependencies only**, pinned to the versions the host app uses so the mount
+test exercises the same reconciler.
 
 ## Running the checks
 
 ```bash
 pytest                       # unit + route tests; offline, no binary needed
 ruff check .
-python -m compileall -q .
+python -m compileall -q harper_ls.py dashboard scripts tests
+npm ci && npm test           # renderer: pure helpers + one jsdom mount
 node --check desktop/plugin.js
 ```
 
-The first three run in CI, along with `hermes plugins validate`. `node --check` is not
+All of them run in CI, along with `hermes plugins validate`. `node --check` is not
 decoration: `desktop/plugin.js` is a single hand-authored ES module and a syntax error in it
 fails the renderer's import silently — run it whenever you touch that file. Formatting is
 not enforced (`ruff format` would reflow the engine's measured-number comments); lint is.
+
+The renderer half is deliberately not under a bundler or a JSX transform, so it cannot import
+test helpers either. `tests/renderer/` therefore reaches the real file through a
+`module.register()` resolve hook that stubs only `@hermes/plugin-sdk` — the same import map the
+Hermes renderer provides — and the assertions that matter (`survivorsAfterApply`,
+`foldReplacements`, `pickForAutoFix`, the row's single control) run against the exported
+functions in `plugin.js` itself. Do not add a build step to make testing easier; the file
+being copy-paste-loadable by the host is the feature.
 
 ## Continuous integration
 
 Two workflows, and the split is deliberate:
 
 - **`ci.yml`** runs on every push and pull request: `ruff check`, `compileall`, the suite on
-  Python 3.11–3.14 (3.11 is the declared floor, 3.14 is what Hermes ships on), and
-  `node --check desktop/plugin.js`. It is offline. A third job compares the pin table against
+  Python 3.11–3.14 (3.11 is the declared floor, 3.14 is what Hermes ships on), and a Node 22
+  job that runs `npm ci`, `node --check desktop/plugin.js` and `npm test`. Both jobs only reach
+  a package registry; nothing in the pull-request path depends on the live Harper release.
+  A third job compares the pin table against
   the live Harper release and runs `fetch_harper_ls.py --verify-only`; it fires weekly and on
   `workflow_dispatch` only, because a red X that depends on github.com being up is a red X
   nobody can act on in review.

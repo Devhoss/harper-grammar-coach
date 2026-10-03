@@ -63,6 +63,7 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 import harper_ls  # noqa: E402  - needs the sys.path shim above
+import technical_spans  # noqa: E402  - same shim
 
 # Every release fact (version, per-platform asset allowlist, byte sizes, download) lives in
 # harper_ls.py, not here. Re-exported under the historical names so the engine and the routes
@@ -82,7 +83,10 @@ VENDOR_DIR = harper_ls.VENDOR_DIR
 DOC_URI_BASE = "file:///hermes-composer"
 DOC_LANGUAGE_ID = "markdown"
 
-# harper-ls blocks on this until the client answers. Omitted linters keep Harper defaults.
+# harper-ls blocks on this until the client answers. ``linters`` is keyed by Harper's
+# CamelCase linter names (verified: ``{"SpellCheck": false}`` silences spell-checking);
+# omitted names keep Harper's own defaults. Passing every known linter as ``true`` is NOT
+# a way to catch more: harper-ls 2.12.0 panics in its thesaurus (WindowSizeTooBig).
 _HARPER_CONFIG_SECTION = {"dialect": "American", "linters": {}}
 
 MAX_TEXT_CHARS = 20_000
@@ -723,6 +727,10 @@ class HarperEngine:
         The cache is keyed on the text alone, not on ``budget_ms``: the only caller that asks
         for a smaller budget is the submit-time auto-fix, and by then the draft is leaving. A
         cached answer from a roomier budget is therefore never worse.
+
+        ``technicalSuppressed`` in the payload counts the diagnostics Harper raised inside
+        machine text that this engine dropped — the difference between "Harper found it, we
+        filtered it" and "Harper never saw it".
         """
         if not isinstance(text, str):
             raise EngineError("bad-input", "text must be a string")
@@ -740,7 +748,7 @@ class HarperEngine:
                 self.start_locked()
 
             diagnostics = self._lint_locked(text)
-            suggestions, truncated = self._build_suggestions(
+            suggestions, truncated, suppressed = self._build_suggestions(
                 text, diagnostics[:MAX_DIAGNOSTICS], budget_ms=budget_ms
             )
 
@@ -753,6 +761,7 @@ class HarperEngine:
             "text": text,
             "suggestions": suggestions,
             "diagnosticCount": len(diagnostics),
+            "technicalSuppressed": suppressed,
             "truncated": truncated,
             "engineMs": round(elapsed_ms, 2),
             "cached": False,
@@ -762,23 +771,35 @@ class HarperEngine:
 
     def _build_suggestions(
         self, text: str, diagnostics: List[Dict[str, Any]], budget_ms: float = ACTION_BUDGET_MS
-    ) -> Tuple[List[Dict[str, Any]], bool]:
+    ) -> Tuple[List[Dict[str, Any]], bool, int]:
         """Merge each diagnostic with its code actions into one renderer-ready suggestion.
 
         Offsets are converted to UTF-16 HERE, not in the renderer: the plugin splices text
         with ``String.prototype.slice``, so a char/UTF-16 mismatch on an astral character
         would corrupt the draft. See :func:`utf16_map`.
 
-        Returns ``(suggestions, truncated)``. ``truncated`` means the code-action budget ran out
-        with diagnostics left over, so the list is partial. It cannot be ranked before paying:
-        ``priority`` and ``lint_kind`` only exist inside the codeAction, never on the diagnostic
-        (verified on 2.12.0), so the spans are resolved in document order and stopped on time.
+        Returns ``(suggestions, truncated, suppressed)``. ``truncated`` means the code-action
+        budget ran out with diagnostics left over, so the list is partial. It cannot be ranked
+        before paying: ``priority`` and ``lint_kind`` only exist inside the codeAction, never on
+        the diagnostic (verified on 2.12.0), so the spans are resolved in document order and
+        stopped on time. ``suppressed`` counts the diagnostics that landed inside machine text
+        (paths, inline code, identifiers) and were dropped — see :mod:`technical_spans`.
+
+        The filter runs twice on purpose. Cheaply, BEFORE paying for a codeAction, but only when
+        the diagnostic's UTF-16 range is provably char-exact (a BMP-only draft, where
+        :func:`utf16_map` is the identity); that is what keeps a path-heavy draft from spending
+        the whole budget on suggestions it will throw away. Then again, authoritatively, on the
+        resolved char span, because that is the only form Harper guarantees.
         """
         mapping = utf16_map(text)
         line_starts = char_line_starts(text)
+        protected = technical_spans.protected_spans(text)
+        # Pre-filtering needs the range to BE the char span; only an identity mapping gives that.
+        can_prefilter = mapping is None and bool(protected)
         out: List[Dict[str, Any]] = []
         deadline = time.perf_counter() + max(0.0, float(budget_ms)) / 1000.0
         truncated = False
+        suppressed = 0
 
         for diagnostic in diagnostics:
             if not isinstance(diagnostic, dict):
@@ -786,6 +807,10 @@ class HarperEngine:
             if time.perf_counter() >= deadline:
                 truncated = True
                 break
+            position_range = diagnostic.get("range") or {}
+            if can_prefilter and self._range_is_protected(position_range, line_starts, protected):
+                suppressed += 1
+                continue
             try:
                 actions = self._code_actions_locked(diagnostic)
             except EngineError as exc:
@@ -793,7 +818,6 @@ class HarperEngine:
                 log.debug("codeAction failed for %s: %s", diagnostic.get("code"), exc)
                 actions = []
 
-            position_range = diagnostic.get("range") or {}
             code = str(diagnostic.get("code") or "")
             priority: Optional[int] = None
             lint_kind: Optional[str] = None
@@ -851,6 +875,12 @@ class HarperEngine:
             if not matched.strip():
                 continue
 
+            if protected and technical_spans.is_protected(protected, start_char, end_char):
+                # Machine text: a path segment, an identifier, a code span. Harper spells these
+                # as if they were English and no word list can tell them apart — only context can.
+                suppressed += 1
+                continue
+
             seen: set = set()
             unique: List[str] = []
             for replacement in replacements:
@@ -882,7 +912,18 @@ class HarperEngine:
             )
 
         out.sort(key=lambda s: s["start"])
-        return out, truncated
+        return out, truncated, suppressed
+
+    @staticmethod
+    def _range_is_protected(
+        position_range: Dict[str, Any], line_starts: List[int], protected: List[Tuple[int, int]]
+    ) -> bool:
+        """Overlap test on the diagnostic's own range, for a draft whose range is char-exact."""
+        start = range_to_char_offset(position_range, line_starts, "start")
+        end = range_to_char_offset(position_range, line_starts, "end")
+        if start is None or end is None or end <= start:
+            return False
+        return technical_spans.is_protected(protected, start, end)
 
     # -- public surface --
 
@@ -1026,6 +1067,7 @@ def post_check(body: CheckRequest) -> Dict[str, Any]:
             "text": text,
             "suggestions": [],
             "diagnosticCount": 0,
+            "technicalSuppressed": 0,
             "truncated": False,
             "engineMs": 0.0,
             "cached": False,

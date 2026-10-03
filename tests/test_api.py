@@ -80,6 +80,7 @@ def test_blank_drafts_are_answered_without_waking_the_engine(client, text):
         "text": text,
         "suggestions": [],
         "diagnosticCount": 0,
+        "technicalSuppressed": 0,
         "truncated": False,
         "engineMs": 0.0,
         "cached": False,
