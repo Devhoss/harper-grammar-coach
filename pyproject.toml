@@ -1,6 +1,6 @@
 [project]
 name = "harper-grammar-coach"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline grammar and spelling coaching for the Hermes Desktop chat composer, powered by harper-ls."
 requires-python = ">=3.11"
 # No runtime dependencies, on purpose. The backend is FastAPI + the standard library, and

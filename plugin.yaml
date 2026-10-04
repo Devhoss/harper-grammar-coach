@@ -1,5 +1,5 @@
 name: harper-grammar-coach
-version: 0.1.0
+version: 0.2.0
 description: >-
   Grammar and spelling coaching for the Hermes Desktop chat composer. A persistent offline
   Harper language server (harper-ls) lints the draft as you type and shows suggestions in a

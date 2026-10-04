@@ -54,14 +54,23 @@ The `harper-ls` binary is **not** in this repository. It is a large platform-spe
 executable, so the plugin downloads the verified asset only when you request it. Fetch it
 once, on purpose:
 
-1. Open the Desktop settings section for this plugin (below the composer, or
-   **Settings ▸ Plugins ▸ Harper Grammar Coach**).
-2. Press **Install Harper** on the **Engine** row.
+1. Open **Settings ▸ Appearance** in Hermes. Use the top-level Appearance page (not a
+   deep-linked Appearance subpage), then scroll to the **Harper Grammar Coach** contribution.
+2. Press **Install Harper** on its **Engine** row. This row is in Appearance settings, not in
+   the plugin card's `config_schema` form under **Capabilities ▸ Plugins**.
 
 That downloads the pinned release asset for your platform (~13–14 MB compressed), checks its
 exact byte size against the release manifest, extracts the executable, and drops it into the
 plugin's `vendor/` directory. The response reports which binary and version it installed.
 Skip the download entirely if you already have a binary — see *Using your own harper-ls*.
+
+Two more routes reach that same action, in case the Appearance page does not render the row:
+the statusbar chip reads **Harper · Install required** while the binary is missing and its
+popover carries an **Install Harper** button, and the command palette has **Harper: Install
+Harper**. None of them fetches anything until you press one — there is no startup download.
+None of them offers a download while the plugin's own API is unreachable either: the palette
+row then reads **Harper backend unavailable**, and pressing it explains that instead of sending
+a request the same backend could not answer. Once the API answers again, the next press installs.
 
 Supported platforms for the automatic install: Windows x86_64, macOS Intel, macOS Apple
 silicon, Linux x86_64, Linux ARM64. Anything else (e.g. Windows ARM64, musl/Alpine) is
@@ -75,6 +84,28 @@ row to apply that suggestion**: the correction row is one accessible button, and
 separate control. **Apply all** stays at the top. The underside list remains available in
 **Suggestion display** settings, and the statusbar provides fallback access when multiple
 composer surfaces are mounted.
+
+The statusbar chip names the state you are actually in — **Harper · Install required**,
+**Starting**, **Ready**, **Unavailable**, **Too long**, or **Harper · N** with suggestions — and
+it reads two separate things to decide: the *engine*, from the payload of the last request that
+answered, and the *transport*, from whether any request answers at all. An empty composer is not
+evidence that anything works, and neither is a `running` engine report from before the API stopped
+answering, so the chip stays clickable whenever there is a reason and an action and only goes
+inert text once a request has vouched for the backend.
+
+Clicking it explains the specific problem. A missing binary reads *Harper engine is not
+installed.* with the engine's own reason, **Install Harper** and **Retry**; the API not answering
+reads *Harper backend is unavailable for the current Hermes backend.* with the HTTP condition,
+the last-known `harper-ls` version and where its binary came from, and **Retry**. Neither one
+shows what you were typing — no diagnostic surface in this plugin does.
+
+**Harper: Diagnose** in the command palette reports that same state as a single line you can
+paste into a bug report: whether the API answers and with which status, the engine state, the
+`harper-ls` version, the binary's source and presence, the check count and last latency, and the
+last error. It re-probes first, so the line describes the backend as of right now. Afterwards the
+renderer keeps working on its own: while the API is filed as unreachable, the composer poll
+re-checks it with a read-only `GET /status` about every 30 seconds, so a backend that comes back
+restores the chip without a click.
 
 The popover opens once for a new set of visible suggestions. Closing it keeps that set
 dismissed through identical rechecks. A set is distinct when its rule, category, incorrect
@@ -172,7 +203,9 @@ profile's plugin installation; it is not part of the Git repository.
 | Symptom | What it means |
 |---|---|
 | Settings section shows *no* engine row, or the composer never checks | The plugin's dashboard API is not mounted for this Hermes process. Enable the plugin, restart Hermes, and check `GET /api/plugins/harper-grammar-coach/status`. |
-| Engine row reads `harper-ls not found` | Nothing was installed yet — press **Install Harper**, or set `HARPER_LS_PATH`. |
+| Engine row reads `harper-ls not found` | Nothing was installed yet — press **Install Harper** (on that row, in the chip's popover, or as **Harper: Install Harper** in the palette), or set `HARPER_LS_PATH`. |
+| Chip reads **Harper · Install required** but you cannot find the Settings row | Some Hermes builds do not render an Appearance contribution. The chip's popover and the palette command both install without it. |
+| Chip reads **Harper · Unavailable** and the popover names the backend, not the engine | The plugin's dashboard API is not answering on this Hermes process. A `404`/`405` here means the router is absent, which is Hermes' plugin lifecycle, not a broken `harper-ls` — Harper reports it and cannot fix it. **Harper: Diagnose** prints the same state as one line; **Retry** and the periodic read-only `/status` probe both restore the chip once the API answers again, with no reinstall. |
 | `harper_ls_path points at a missing file: …` | The configured path is wrong or the file was moved. Fix the path; the plugin will not substitute a different binary behind your back. |
 | `unsupported-platform` | No pinned release asset for this OS/architecture. Install `harper-ls` yourself and point `HARPER_LS_PATH` at it. |
 | `size-mismatch` on install | The download did not match the pinned byte size. Do not retry around it — something between you and GitHub changed the payload. |

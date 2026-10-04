@@ -3,7 +3,7 @@
   "label": "Harper Grammar Coach",
   "description": "Offline grammar and spelling checks for the Desktop chat composer, powered by harper-ls.",
   "icon": "SpellCheck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tab": { "hidden": true },
   "api": "plugin_api.py"
 }

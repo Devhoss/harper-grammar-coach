@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
 ### Added
 - `harper_ls.py` as the single source of truth for the pinned harper-ls release: the
   per-platform asset allowlist with exact release-asset byte sizes, binary resolution
@@ -34,6 +36,15 @@ All notable changes to this project are documented here. The format follows
   imports nothing but `@hermes/plugin-sdk` and `react`) plus `tests/renderer/`, which loads the
   real `desktop/plugin.js` through a resolve hook that stubs the SDK, runs the pure helpers
   under `node:test`, and mounts the strip once under jsdom.
+- `statusChipView`, the statusbar chip's label decision, and a **Harper: Install Harper** palette
+  command. A fresh Git install deliberately has no `vendor/` binary, and some Hermes builds do not
+  render the Appearance Engine row at all — so the chip and the palette are two more routes to the
+  same explicit `/bootstrap`. Neither one downloads anything by itself.
+- `Harper: Diagnose`, a palette command that reports the plugin's own technical state as one
+  line: whether the API answers and with which HTTP status, the engine state, the `harper-ls`
+  version, the binary's source and presence, the check count, the last check's latency, and the
+  last error. It is a pure function of a snapshot that has no path to the composer, so the report
+  cannot carry draft text — same rule as the log and the popover.
 
 ### Changed
 - Composer suggestions now auto-open once when a new visible suggestion set appears. Closing a
@@ -69,6 +80,30 @@ All notable changes to this project are documented here. The format follows
   the recheck runs, and the count reads `2 suggestions · checking…` until Harper's fresh
   answer arrives. A survivor whose text no longer matches is dropped rather than kept at a
   stale offset, so a click can never apply an old suggestion to a changed draft.
+- The statusbar chip now reads the **engine**, not only the last draft check. Every poll of an
+  empty composer resets the check state to idle, which is the normal state right after a restart,
+  so a plugin with no `harper-ls` at all displayed an inert `Harper · Ready` and hid the only
+  reachable install action. It reads **Harper · Install required** while no binary resolves,
+  **Unavailable** while the engine cannot be started, and stays clickable in both cases, with the
+  engine's own reason, **Install Harper** and **Retry** in its popover. `Harper · Ready` now
+  requires evidence.
+- It also reads the **transport**, separately. Engine metadata only ever came from a *successful*
+  response, so when the plugin's API stopped being mounted under it the chip kept vouching for a
+  backend that no longer answered. A `404`/`405` is now classified as an unreachable API — it
+  outranks the stale engine report and the install claim, invalidates the ready state, and is
+  retried with the same bounded ladder as a startup miss. The chip then explains itself
+  (**Harper backend is unavailable for the current Hermes backend.**, the HTTP condition, the
+  last-known version and binary source, **Retry**) and heals on its own: while unreachable, the
+  composer poll issues one read-only `GET /status` about every 30 s, so a backend that comes back
+  restores **Ready** without a click. A probe that reaches an API with no usable binary reports
+  reachable and deliberately keeps the check gate latched, because reaching the backend and being
+  able to check are different facts.
+- The **Harper: Install Harper** palette row names the thing that is actually missing. While the
+  API is unreachable it reads `Harper backend unavailable` instead of `engine not installed` —
+  an unmounted router cannot prove the engine is absent, and it cannot serve a download either —
+  and pressing it gives the backend-unavailable explanation rather than a doomed 240-second
+  request. The Appearance **Engine** row goes through the same gate. It is a re-check, not a
+  latch: once the API answers again, the next press installs.
 
 ## [0.1.0] - 2026-10-02
 
@@ -82,5 +117,6 @@ First packaged release.
 - `harper_ls_path` setting and `HARPER_LS_PATH` environment override for pointing at a
   different build.
 
-[unreleased]: https://github.com/Devhoss/harper-grammar-coach/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/Devhoss/harper-grammar-coach/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Devhoss/harper-grammar-coach/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Devhoss/harper-grammar-coach/releases/tag/v0.1.0

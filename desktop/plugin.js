@@ -71,6 +71,10 @@ const CHECK_RETRY_MS = 3_000
  *  profile scope is installed. Keep that recovery bounded and well below the
  *  much longer per-request timeout budget. */
 const WARM_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 15_000]
+/** How often the tick re-checks a backend it had filed as unreachable. This is the plugin healing
+ *  itself — a Hermes backend that comes back with the router mounted must not need a click. Read
+ *  only (`GET /status`), and deliberately slower than the tick so it cannot spam a down backend. */
+const API_PROBE_MS = 30_000
 /** Server-side ceiling for the code-action phase, in ms. That phase is the only part
  *  of a check that grows with the draft — Harper re-parses the whole document per
  *  action (~14 ms at 1k chars, ~254 ms at 20k) — so the renderer states how long it is
@@ -370,6 +374,77 @@ export function countLabel({ count = 0, truncated = false, checking = false }) {
   return `${base}${truncated ? ' · partial' : ''}${checking ? ' · checking…' : ''}`
 }
 
+/** Decide the statusbar chip's label and whether it stays a popover trigger.
+ *
+ *  BOTH inputs are load-bearing, which is the whole point. `checkState` describes the last draft
+ *  check and legitimately returns to `idle` the moment the composer is empty — so on its own it
+ *  says "Ready" for a plugin whose engine was never installed, and the chip would drop its
+ *  popover along with the only reachable Install action. `engineState` is the backend's own
+ *  answer (`binary` null exactly when resolution failed), so it can overrule the check state.
+ *  Neither alone describes the chip the user needs. */
+export function statusChipView({ checkState, engineState, items, showSuggestions }) {
+  if (showSuggestions && items.length) {
+    return { label: `${items.length} suggestions`, caption: `Harper · ${items.length}`, clickable: true, needsInstall: false }
+  }
+
+  // Reachability is its own verdict, taken from the TRANSPORT and not from the engine payload:
+  // `adopt()` only runs on a successful response, so a route that disappeared mid-session leaves
+  // `engineState` holding its last healthy answer. Ranking it first is what stops a stale
+  // `running` from being displayed as `Ready` over a backend that no longer answers. It also
+  // outranks `starting` — a warm ladder retrying against a dead API is not a startup in progress.
+  const apiDown = engineState.backend === 'unreachable'
+  // `unknown` is "no status has come back yet" — claiming an install is required off a default
+  // atom would be the same kind of lie as the old false Ready, in the other direction. An
+  // unreachable API outranks the claim too: nothing answered, so nothing is known about the binary.
+  const needsInstall = !apiDown && engineState.state !== 'unknown' && !engineState.binary && engineState.state !== 'running'
+  // `offline` and `crashed` are what the backend reports when it cannot give it a working
+  // harper-ls, binary found or not. A draft check that then went `idle` (empty composer) must not
+  // upgrade that back to "Ready".
+  const engineDown = engineState.state === 'offline' || engineState.state === 'crashed'
+  const label = apiDown
+    ? 'Unavailable'
+    : checkState === 'starting'
+      ? 'Starting'
+      : needsInstall
+        ? 'Install required'
+        : engineDown || checkState === 'offline' || checkState === 'error'
+          ? 'Unavailable'
+          : checkState === 'too-long'
+            ? 'Too long'
+            : 'Ready'
+
+  return { label, caption: `Harper · ${label}`, clickable: label !== 'Ready', needsInstall }
+}
+
+/** One line a user can paste into a bug report, from the `diagnose()` snapshot.
+ *
+ *  Pure, and deliberately fed only by that snapshot: the report goes out as a toast and a console
+ *  line, and the plugin's whole promise is that the draft never leaves the machine — a diagnostic
+ *  surface is exactly where leaking it would be careless. So the snapshot, and therefore this
+ *  function, has no path to the composer at all. */
+export function formatDiagnose(snapshot) {
+  const bits = []
+
+  if (snapshot.backend === 'unreachable') {
+    bits.push(`API unreachable${snapshot.backendStatus ? ` (${snapshot.backendStatus})` : ''}`)
+  } else if (snapshot.backend === 'reachable') {
+    bits.push(`API reachable (${snapshot.backendStatus || 200})`)
+  } else {
+    bits.push('API not yet reached')
+  }
+
+  bits.push(`engine ${snapshot.engineState}`)
+  if (snapshot.version) bits.push(`v${snapshot.version}`)
+  if (snapshot.binarySource) bits.push(`from ${snapshot.binarySource}`)
+  bits.push(snapshot.binaryPresent ? 'binary present' : 'binary missing')
+  bits.push(`${Number(snapshot.checks) || 0} ${Number(snapshot.checks) === 1 ? 'check' : 'checks'}`)
+  bits.push(`${Number(snapshot.lastCheckMs) || 0} ms`)
+  if (snapshot.reason) bits.push(snapshot.reason)
+  if (snapshot.lastError) bits.push(`last error: ${snapshot.lastError}`)
+
+  return `Harper: ${bits.join(' · ')}`
+}
+
 /** `api-transport` shapes a non-2xx as `Error("<status>: <raw body>")`. Only the
  *  message survives the `ipcRenderer.invoke` rejection (structured clone keeps
  *  name/message/stack and drops `statusCode`), so the prefix is the status. Our
@@ -425,6 +500,15 @@ function isTimeoutError(err) {
   return /timed out/i.test(err && typeof err.message === 'string' ? err.message : '')
 }
 
+/** A 404 or a 405 on this prefix is never ours — the backend only answers 400, 413 and 503 with a
+ *  `detail.reason`. Both are FastAPI saying the plugin's router is not mounted: 404 when the SPA
+ *  catch-all is not installed at all (a headless backend), 405 when it is, because that catch-all
+ *  answers GET only and our requests are POSTs. Either way the Harper API the renderer is talking
+ *  to does not exist on this backend, which is a reachability verdict, not an engine verdict.
+ *
+ *  Measured on a real app: uninstalling the Hermes profile that owned this plugin's dashboard
+ *  package leaves a rebuilt backend with no router to mount, and every request becomes
+ *  `405: {"detail":"Method Not Allowed"}`. */
 export function errorReason(err) {
   const detail = parseDetail(err)
 
@@ -432,18 +516,19 @@ export function errorReason(err) {
     return detail.reason
   }
 
-  return httpStatus(err) === 404 ? 'not-mounted' : ''
+  const status = httpStatus(err)
+
+  return status === 404 || status === 405 ? 'not-mounted' : ''
 }
 
 export function describeError(err) {
   const detail = parseDetail(err)
 
-  // A 404 on this prefix is never ours — the backend only answers 400, 413 and 503 — so it is
-  // FastAPI's route miss, whose body is `{"detail":"Not Found"}`. That generic string carries
-  // no information and must not outrank the explanation a user can act on. During startup it
-  // can also mean the request reached the primary profile before the active profile was ready.
-  if (httpStatus(err) === 404) {
-    return 'Harper API is not available on the current backend. Check the active profile and plugin settings.'
+  // The generic FastAPI bodies (`Not Found`, `Method Not Allowed`) name nothing the user can act
+  // on and must not outrank the explanation, so an unmounted route gets its own sentence here
+  // rather than the raw body below.
+  if (errorReason(err) === 'not-mounted') {
+    return 'Harper backend is unavailable for the current Hermes backend. Check that the Agent plugin is enabled for this profile, then press Retry.'
   }
 
   if (detail?.message) {
@@ -460,8 +545,9 @@ export function describeError(err) {
 }
 
 /** Startup failures that can resolve without changing Harper configuration.
- *  A 404 is transient here because ctx.rest may still be scoped to Hermes'
- *  primary profile; repeated failure is surfaced after the bounded retry budget. */
+ *  A 404/405 is transient here because `ctx.rest` may still be scoped to Hermes' primary profile,
+ *  and because a backend that boots before its plugin router is mounted answers with the SPA
+ *  catch-all; repeated failure is surfaced after the bounded retry budget. */
 function isTransientWarmFailure(err) {
   const reason = errorReason(err)
   const status = httpStatus(err)
@@ -483,7 +569,7 @@ function isTransientWarmFailure(err) {
 
 function exhaustedWarmMessage(err) {
   if (errorReason(err) === 'not-mounted') {
-    return 'Harper could not reach the API for the active profile after startup retries. Check that the Agent plugin is enabled, then press Retry.'
+    return 'Harper backend is unavailable for the current Hermes backend: the API could not be reached after startup retries. Check that the Agent plugin is enabled for this profile, then press Retry.'
   }
 
   return `Harper backend is still unavailable after startup retries. ${describeError(err)} Press Retry to try again.`
@@ -510,15 +596,27 @@ function log(...args) {
 // --- state -------------------------------------------------------------------
 
 const $settings = atom(normalizeSettings(null))
-const $engine = atom({
+/** The last thing the renderer knows about the plugin's OWN backend, as two independent axes:
+ *  `state`/`version`/`binary` come from the payload of a SUCCESSFUL request (and therefore go
+ *  stale when the route disappears), while `backend`/`backendStatus` come from the transport of
+ *  every request, successful or not. Keeping them separate is the whole point — a chip that
+ *  derived reachability from the engine payload would report `Ready` over a dead API, which is
+ *  exactly what was measured after the profile that owned this API was uninstalled. */
+const DEFAULT_ENGINE = {
   state: 'unknown',
   version: '',
   reason: null,
   binary: null,
+  binarySource: null,
   checks: 0,
   lastCheckMs: 0,
-  dialect: DEFAULTS.dialect
-})
+  dialect: DEFAULTS.dialect,
+  backend: 'unknown',
+  backendStatus: 0,
+  backendReason: null,
+  lastError: null
+}
+const $engine = atom({ ...DEFAULT_ENGINE })
 /** The cleared-check shape every reset publishes, so a new reset site cannot
  *  drop a field the strip reads. */
 const IDLE_CHECK = { state: 'idle', text: '', suggestions: [], truncated: false }
@@ -566,6 +664,11 @@ function closeSuggestionsPopover() {
 // --- engine ------------------------------------------------------------------
 
 export function createEngine(ctx) {
+  // This instance is the only writer `$engine` has, so its lifetime is the engine's: a new one
+  // (registration, hot reload, disable→enable) starts knowing nothing. Inheriting the previous
+  // instance's `running` answer is the same false claim the stale-adopt bug made, one reload
+  // before any request has been made.
+  $engine.set({ ...DEFAULT_ENGINE })
   let generation = 0
   let dueAt = 0
   let lastSeen = null
@@ -593,6 +696,11 @@ export function createEngine(ctx) {
   let warmReadyAt = 0
   let suppressAutoOpenText = null
   let applyFocusGuardTimer = null
+  /** Cadence bookkeeping for the recovery probe: `lastProbeAt` is the only thing standing between
+   *  a downed backend and a `/status` every 250 ms, and `probePromise` collapses the concurrent
+   *  callers (tick, popover open, Retry) into one request. */
+  let lastProbeAt = 0
+  let probePromise = null
 
   const publish = next => {
     if (!disposed) {
@@ -630,15 +738,50 @@ export function createEngine(ctx) {
     publish({ state: 'offline', text: '', suggestions: [], reason })
   }
 
+  /** A request that got an answer. `adopt()` does the same for a request that got a payload;
+   *  nothing in the draft-check path may change the reachability verdict, which is what makes an
+   *  unreachable API survive the IDLE publish an empty composer produces. */
+  const markReachable = () => {
+    $engine.set({ ...$engine.get(), backend: 'reachable', backendStatus: 200, backendReason: null })
+  }
+
+  /** Record what went wrong, and — for a 404/405 — that the API itself is gone. A 500 or a
+   *  timeout proves the backend is answering, so it must not be filed as unreachable. */
+  const noteError = err => {
+    const sentence = describeError(err)
+    const patch = { lastError: sentence }
+
+    if (errorReason(err) === 'not-mounted') {
+      patch.backend = 'unreachable'
+      patch.backendStatus = httpStatus(err)
+      patch.backendReason = sentence
+    }
+
+    $engine.set({ ...$engine.get(), ...patch })
+  }
+
   const publishError = (err, text) => {
     const reason = errorReason(err)
     const status = httpStatus(err)
+
+    // An unmounted route is the API vanishing, not the engine failing. Invalidate the stale
+    // `running` answer along with the check, or the chip keeps vouching for a backend that
+    // stopped answering mid-session — which is exactly how `Harper · Ready` was displayed over
+    // a 405.
+    if (reason === 'not-mounted') {
+      noteError(err)
+      backendDown = true
+      publishOffline(describeError(err))
+
+      return
+    }
 
     // A missing or unstartable binary is a durable condition, not a blip: stop firing until
     // the user retries, restarts, or installs. The recoverable ones are deliberately NOT
     // latched — the backend re-spawns harper-ls by itself on the next check, so going offline
     // here would strand the strip on a wedge that the next keystroke already fixes.
-    if (status === 404 || (status >= 500 && !RECOVERABLE_REASONS.has(reason))) {
+    if (status >= 500 && !RECOVERABLE_REASONS.has(reason)) {
+      noteError(err)
       backendDown = true
       publishOffline(describeError(err))
 
@@ -651,6 +794,7 @@ export function createEngine(ctx) {
       return
     }
 
+    noteError(err)
     publish({ state: 'error', text, suggestions: [], reason: describeError(err) })
   }
 
@@ -682,6 +826,9 @@ export function createEngine(ctx) {
 
       backendDown = false
       offlineShown = false
+      // The request answered, so whatever the last failure said, the API is there now. This is
+      // the recovery path for a backend that came back between two keystrokes.
+      markReachable()
       checkedText = text
       checkedResult = payload
       const suggestions = Array.isArray(payload?.suggestions) ? payload.suggestions : []
@@ -723,6 +870,15 @@ export function createEngine(ctx) {
   const tick = async () => {
     if (disposed || reading) {
       return
+    }
+
+    // Recovery has to run from the one loop that always turns, and above every early return
+    // below: an empty composer is the normal state right after a restart, so a gate placed with
+    // the checking logic would leave the chip filed under `unreachable` forever. It also runs
+    // while a warm ladder is still retrying — the ladder is bounded, this is what notices the
+    // route came back inside it.
+    if ($engine.get().backend === 'unreachable' && Date.now() - lastProbeAt >= API_PROBE_MS) {
+      void probeBackend()
     }
 
     reading = true
@@ -822,10 +978,12 @@ export function createEngine(ctx) {
 
       checkedText = text
       checkedResult = payload
+      markReachable()
 
       return payload
     } catch (err) {
       log('checkNow failed', errorReason(err) || describeError(err))
+      noteError(err)
 
       return null
     }
@@ -912,19 +1070,29 @@ export function createEngine(ctx) {
     }
   }
 
+  /** Take in a payload from the plugin's own API. Reaching this at all is proof the API answered,
+   *  so the transport verdict moves with it; the engine fields below are what the payload says. */
   const adopt = payload => {
     if (!payload || typeof payload !== 'object') {
       return
     }
 
     $engine.set({
+      ...$engine.get(),
       state: payload.state || 'unknown',
       version: payload.version || '',
       reason: payload.reason ?? null,
       binary: payload.binary ?? null,
+      // Which of the resolution sources (env override, vendored release, PATH) answered. The
+      // settings page and the popover show it because "harper-ls is there" and "harper-ls is the
+      // one this plugin installed" are different things to a user reading a bug report.
+      binarySource: typeof payload.binarySource === 'string' ? payload.binarySource : null,
       checks: Number(payload.checks) || 0,
       lastCheckMs: Number(payload.lastCheckMs) || 0,
-      dialect: payload.dialect || DEFAULTS.dialect
+      dialect: payload.dialect || DEFAULTS.dialect,
+      backend: 'reachable',
+      backendStatus: 200,
+      backendReason: null
     })
   }
 
@@ -963,6 +1131,10 @@ export function createEngine(ctx) {
         const reason = payload.reason || ''
         const error = new Error(payload.message || reason || 'Harper engine offline')
         error.reason = reason
+        // Reachable: the backend answered with a payload. Only the engine is unusable, and
+        // conflating the two would hide `Install required` behind an `Unavailable` the user has
+        // no way to act on.
+        $engine.set({ ...$engine.get(), lastError: describeError(error) })
         backendDown = true
         offlineShown = true
         return { ok: false, error, transient: RECOVERABLE_REASONS.has(reason) }
@@ -982,6 +1154,7 @@ export function createEngine(ctx) {
         return { ok: true }
       }
     } catch (err) {
+      noteError(err)
       backendDown = true
       offlineShown = true
       log('warm failed', describeError(err))
@@ -1037,7 +1210,78 @@ export function createEngine(ctx) {
     try {
       adopt(await ctx.rest('/status', { timeoutMs: CHECK_TIMEOUT_MS }))
     } catch (err) {
+      noteError(err)
       log('status failed', describeError(err))
+    }
+  }
+
+  /** One read-only `/status`, for the two paths that have to find out whether the API came back:
+   *  the tick's recovery cadence and the chip's Retry.
+   *
+   *  Resolves to "did the backend answer", which is NOT "can Harper check anything" — a probe that
+   *  reaches an API with no binary therefore keeps `backendDown` latched. Unlatching on
+   *  reachability alone would hand a doomed `/check` back to every debounce for the rest of the
+   *  session, which is the wedge the latch exists to prevent. */
+  const probeBackend = async () => {
+    if (disposed) {
+      return false
+    }
+
+    if (probePromise) {
+      return probePromise
+    }
+
+    lastProbeAt = Date.now()
+
+    probePromise = (async () => {
+      try {
+        const payload = await ctx.rest('/status', { timeoutMs: CHECK_TIMEOUT_MS })
+
+        adopt(payload)
+
+        const usable = Boolean(payload?.binary) && payload.state !== 'offline' && payload.state !== 'crashed'
+
+        backendDown = !usable
+        offlineShown = false
+
+        if (usable) {
+          lastSeen = null
+          dueAt = Date.now()
+        }
+
+        log('probe', { state: payload?.state, binary: Boolean(payload?.binary), usable })
+
+        return true
+      } catch (err) {
+        noteError(err)
+        log('probe failed', describeError(err))
+
+        return false
+      } finally {
+        probePromise = null
+      }
+    })()
+
+    return probePromise
+  }
+
+  /** The safe technical report: the plugin's own state, and nothing the user is writing. Field
+   *  list is deliberately closed — every entry has to survive being pasted into a bug report. */
+  const diagnose = () => {
+    const state = $engine.get()
+
+    return {
+      backend: state.backend,
+      backendStatus: state.backendStatus,
+      engineState: state.state,
+      version: state.version,
+      binarySource: state.binarySource,
+      binaryPresent: Boolean(state.binary),
+      needsInstall: state.state !== 'unknown' && !state.binary && state.state !== 'running',
+      checks: state.checks,
+      lastCheckMs: state.lastCheckMs,
+      reason: state.reason,
+      lastError: state.lastError
     }
   }
 
@@ -1049,6 +1293,7 @@ export function createEngine(ctx) {
     try {
       adopt(await ctx.rest('/config', { method: 'POST', body: { dialect }, timeoutMs: 15_000 }))
     } catch (err) {
+      noteError(err)
       host.notify({ kind: 'error', message: `Harper dialect not applied: ${describeError(err)}` })
     }
   }
@@ -1065,14 +1310,31 @@ export function createEngine(ctx) {
       await warm()
       host.notify({ kind: 'success', message: 'Harper engine restarted.' })
     } catch (err) {
+      noteError(err)
       offlineShown = true
       publishOffline(describeError(err))
       host.notify({ kind: 'error', message: `Harper restart failed: ${describeError(err)}` })
     }
   }
 
-  /** User-triggered download of the pinned harper-ls release. Never automatic. */
+  /** User-triggered download of the pinned harper-ls release. Never automatic.
+   *
+   * `/bootstrap` lives on the same router as `/status`, so a route the probe cannot reach cannot
+   * serve the download either — POSTing at it burns a 240-second timeout to answer a question we
+   * can ask for free. Probing first also refreshes a verdict that has since gone stale, which is
+   * what keeps this a gate on the CURRENT backend rather than a latch on the last failure.
+   */
   const bootstrap = async () => {
+    if (!(await probeBackend())) {
+      host.notify({
+        kind: 'error',
+        message:
+          'Harper backend is unavailable for the current Hermes backend. Installing needs that API: check that the Agent plugin is enabled for this profile, then try again.'
+      })
+
+      return false
+    }
+
     try {
       const payload = await ctx.rest('/bootstrap', { method: 'POST', timeoutMs: 240_000 })
 
@@ -1086,6 +1348,7 @@ export function createEngine(ctx) {
 
       return true
     } catch (err) {
+      noteError(err)
       host.notify({ kind: 'error', message: `Harper install failed: ${describeError(err)}` })
 
       return false
@@ -1139,6 +1402,8 @@ export function createEngine(ctx) {
     ignore,
     warm,
     refreshStatus,
+    probeBackend,
+    diagnose,
     setDialect,
     restart,
     bootstrap,
@@ -1147,6 +1412,9 @@ export function createEngine(ctx) {
     dispose,
     get backendDown() {
       return backendDown
+    },
+    get backendState() {
+      return $engine.get().backend
     },
     get warming() {
       return warming
@@ -1471,28 +1739,54 @@ function StatusChip({ engine }) {
   const fallback = surfaces !== 1
   const showSuggestions = fallback && items.length > 0
   const popoverOpen = showSuggestions ? suggestionsOpen : open
-  const issue = ['starting', 'offline', 'error', 'too-long'].includes(check.state)
-  const popover = showSuggestions || issue
-  const label = check.state === 'starting' ? 'Starting' : check.state === 'offline' || check.state === 'error' ? 'Unavailable' : check.state === 'too-long' ? 'Too long' : showSuggestions ? `${items.length} suggestions` : 'Ready'
-  const caption = showSuggestions ? `Harper · ${items.length}` : `Harper · ${label}`
+  const { label, caption, clickable, needsInstall } = statusChipView({ checkState: check.state, engineState, items, showSuggestions })
+  // Read off the same field the label is built from, not off the label: the popover has to explain
+  // the API being gone even in the states where the engine metadata also happens to be stale.
+  const apiDown = engineState.backend === 'unreachable'
+  // What the chip can be clicked to explain. `needsInstall` is deliberately separate from the
+  // warn styling: an engine that simply is not installed yet is a to-do, not a fault.
+  const issue = apiDown
+    || ['starting', 'offline', 'error', 'too-long'].includes(check.state)
+    || engineState.state === 'offline'
+    || engineState.state === 'crashed'
+  // The headline names the thing that is actually missing. Everything under it is the evidence,
+  // and none of it is the draft — this popover is a diagnostic surface like the toast and the log.
+  const headline = apiDown
+    ? 'Harper backend is unavailable for the current Hermes backend.'
+    : needsInstall
+      ? 'Harper engine is not installed.'
+      : null
+  const note = apiDown
+    ? engineState.backendReason || 'No Harper API request is answering on this backend.'
+    : needsInstall
+      ? engineState.reason || 'The harper-ls engine is not installed yet.'
+      : check.reason || (check.state === 'too-long' ? 'Draft too long to check.' : 'Harper is recovering.')
 
   const trigger = jsx(Button, {
     variant: 'ghost', size: 'micro',
     'aria-label': showSuggestions ? `Harper, ${items.length} suggestions` : `Harper status: ${label}`,
     title: check.truncated ? TRUNCATED_HINT : 'Harper Grammar Coach',
     children: jsxs('span', { className: 'hgc-status', children: [
-      jsx(check.state === 'offline' || check.state === 'error' ? icons.AlertTriangle : icons.CircleLetterA, { className: 'hgc-ico' }),
+      jsx(needsInstall ? icons.Download : (apiDown || check.state === 'offline' || check.state === 'error' ? icons.AlertTriangle : icons.CircleLetterA), { className: 'hgc-ico' }),
       jsx(Badge, { variant: issue ? 'warn' : 'muted', size: 'xs', children: caption })
     ]})
   })
 
-  if (!popover) return jsx('span', {
+  if (!clickable) return jsx('span', {
     className: 'hgc-status-static',
     children: jsxs('span', { className: 'hgc-status', children: [
       jsx(icons.CircleLetterA, { className: 'hgc-ico' }),
       jsx(Badge, { variant: 'muted', size: 'xs', children: caption })
     ]})
   })
+
+  const metadata = [
+    engineState.state === 'unknown' ? null : engineState.state,
+    engineState.version ? `v${engineState.version}` : null,
+    // Last-known on purpose: when the API stopped answering this is the state it answered with,
+    // which is what tells the user the route went away rather than the install never happening.
+    engineState.binarySource ? engineState.binarySource : null
+  ].filter(Boolean).join(' · ')
 
   return jsxs(Popover, {
     open: popoverOpen,
@@ -1509,15 +1803,25 @@ function StatusChip({ engine }) {
           jsxs('div', { className: 'hgc-row', children: [
             jsx('span', { className: 'hgc-h', children: 'Harper Grammar Coach' }),
             jsx('span', { className: 'hgc-spacer' }),
-            jsx('span', { className: 'hgc-sub', children: `${engineState.state}${engineState.version ? ` · v${engineState.version}` : ''}` })
+            jsx('span', { className: 'hgc-sub', children: metadata })
           ]}),
-          issue ? jsx('div', { className: 'hgc-note', children: check.reason || (check.state === 'too-long' ? 'Draft too long to check.' : 'Harper is recovering.') }) : null,
-          issue && check.state !== 'too-long' ? jsx(Button, { variant: 'ghost', size: 'micro', onClick: () => void engine.recheck(), children: 'Retry' }) : null,
+          headline ? jsx('div', { className: 'hgc-h', children: headline }) : null,
+          issue || needsInstall || apiDown ? jsx('div', { className: 'hgc-note', children: note }) : null,
+          // Install only when there is an API to receive it: `/bootstrap` is a Harper endpoint, so
+          // with the router gone the button promises a request that cannot be made.
+          needsInstall && !apiDown ? jsx(Button, {
+            variant: 'secondary',
+            size: 'micro',
+            title: `Downloads the pinned harper-ls ${engineState.version || ''} release into the plugin's vendor directory. Nothing is fetched until you press this.`,
+            onClick: () => void engine.bootstrap(),
+            children: jsxs('span', { className: 'hgc-status', children: [jsx(icons.Download, {}), 'Install Harper'] })
+          }) : null,
+          (issue || apiDown || needsInstall) && check.state !== 'too-long' ? jsx(Button, { variant: 'ghost', size: 'micro', onClick: () => void engine.recheck(), children: 'Retry' }) : null,
           showSuggestions ? jsxs('div', { children: [
             jsx(ApplyAllButton, { items, engine }),
             jsx(SuggestionList, { suggestions: check.suggestions, engine, ignored, text: check.text })
           ]}) : null,
-          !showSuggestions && !issue ? jsx('div', { className: 'hgc-note', children: `${settings.live ? 'Live checking enabled' : 'Live checking disabled'}${check.state === 'checking' ? ' · Checking draft…' : ''}` }) : null
+          !showSuggestions && !issue && !needsInstall && !apiDown ? jsx('div', { className: 'hgc-note', children: `${settings.live ? 'Live checking enabled' : 'Live checking disabled'}${check.state === 'checking' ? ' · Checking draft…' : ''}` }) : null
         ]})
       }, 'content')
     ]
@@ -1944,6 +2248,68 @@ export default {
             host.notify({
               kind: 'info',
               message: `Harper live checking ${next.live ? 'enabled' : 'disabled'}.`
+            })
+          }
+        }
+      },
+      // The fallback for a fresh Git install, where the binary is intentionally absent and
+      // Hermes' Appearance contribution has been observed not to surface the Engine row. The
+      // command IS the user's consent: `bootstrap` is only ever reached from here or from a
+      // button, never from load, restart or a check.
+      {
+        id: 'install-engine',
+        area: PALETTE_AREA,
+        order: 43,
+        data: {
+          id: 'harper.installEngine',
+          label: 'Harper: Install Harper',
+          icon: icons.Download,
+          keywords: ['harper', 'engine', 'install', 'binary', 'download', 'setup'],
+          detail: () => {
+            const engineState = $engine.get()
+
+            // A dead router cannot serve a download, and it cannot prove the engine is absent
+            // either, so the row names the thing that is actually missing.
+            if (engineState.backend === 'unreachable') {
+              return 'Harper backend unavailable'
+            }
+
+            return engineState.binary ? `v${engineState.version || 'unknown'}` : 'engine not installed'
+          },
+          detailVariant: 'state',
+          run: () => void engine.bootstrap()
+        }
+      },
+      // The route to the technical state that does not depend on the chip rendering, the settings
+      // page being reachable, or the user remembering which profile owns the backend. Probes once
+      // first, so a report taken right after the backend came back describes the backend it just
+      // talked to rather than the last verdict the renderer filed.
+      {
+        id: 'diagnose',
+        area: PALETTE_AREA,
+        order: 44,
+        data: {
+          id: 'harper.diagnose',
+          label: 'Harper: Diagnose',
+          icon: icons.Stethoscope,
+          keywords: ['harper', 'diagnose', 'troubleshoot', 'status', 'engine', 'backend', 'api'],
+          detail: () => $engine.get().backend,
+          detailVariant: 'state',
+          run: async () => {
+            await engine.probeBackend()
+
+            const snapshot = engine.diagnose()
+
+            log('diagnose', {
+              backend: snapshot.backend,
+              status: snapshot.backendStatus,
+              engine: snapshot.engineState,
+              binary: snapshot.binaryPresent
+            })
+            host.notify({
+              kind: snapshot.backend === 'unreachable' ? 'error' : snapshot.needsInstall ? 'warning' : 'success',
+              message: formatDiagnose(snapshot),
+              durationMs: 12_000
             })
           }
         }
