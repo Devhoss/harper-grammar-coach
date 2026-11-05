@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Suggestion popovers no longer auto-open. New suggestions update the **Harper · N** badge
+  only, and the list opens on click — an auto-opening panel covered the tail of long drafts
+  and hid the text being typed. Resuming typing while the list is open now closes it while
+  the next check runs; applying a correction still keeps the open state. Palette and
+  keybind (`Mod+Alt+H`) entry points are unchanged.
+- Keybind fix: **Apply all** moved off `Mod+Alt+Shift+H` to `Mod+Alt+A`, and popover open
+  now focuses the first suggestion row instead of the **Apply all** button. The old
+  shift-only difference between the two `H` chords made a stray Shift silently mass-apply
+  with no popup, and Radix's default focus put Enter on Apply all right after a keyboard
+  open. Store overrides in Settings ▸ Keyboard Shortcuts still win over the new default.
+- Harper engine bumped from **v2.12.0** to **v3.0.0** (`harper_ls.py` pin + asset sizes).
+  Verified the LSP surface is unchanged by running the real engine end-to-end (fresh
+  `HARPER_PIN_TEST` manifest check, real-binary probe of spelling/capitalisation/
+  technical-span filtering with exact-offset assertions). The `feat(core)!` dictionary
+  case-handling change can alter which diagnostics are emitted, but offsets, action
+  shapes and the check pipeline behave identically. Users on an installed v2 binary pick
+  up v3 on their next explicit **Install Harper** (or `POST /bootstrap`).
+
 ## [0.2.0] - 2026-10-04
 
 ### Added

@@ -21,6 +21,7 @@ async function setup({ draft = 'Thiss is a mistke.', result = suggestions, displ
   composer.reset(draft)
   const contributions = []
   const restCalls = []
+  let poll = null
   const savedSettings = { suggestionDisplay: display }
   if (correctOnSend !== undefined) savedSettings.correctOnSend = correctOnSend
   const storage = new Map([['settings', savedSettings]])
@@ -42,7 +43,7 @@ async function setup({ draft = 'Thiss is a mistke.', result = suggestions, displ
     },
     registerMany: rows => contributions.push(...rows),
     onDispose() {},
-    setInterval() {}
+    setInterval: fn => { poll = fn }
   })
   const container = document.createElement('div')
   const root = createRoot(container)
@@ -57,7 +58,7 @@ async function setup({ draft = 'Thiss is a mistke.', result = suggestions, displ
   children.push(status.render())
   act(() => root.render(React.createElement('div', null, ...children)))
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
-  return { container, root, contributions, storage, middleware, restCalls }
+  return { container, root, contributions, storage, middleware, restCalls, poll: () => act(async () => { await poll(); await new Promise(resolve => setTimeout(resolve, 0)) }) }
 }
 
 async function recheck(view) {
@@ -67,13 +68,19 @@ async function recheck(view) {
 function dispose(view) { act(() => view.root.unmount()) }
 function rows(node) { return [...node.querySelectorAll('.hgc-apply-row')] }
 function trigger(node) { return [...node.querySelectorAll('button')].find(button => /^Harper · /.test(button.textContent)) }
+async function openPopover(view) {
+  await act(async () => { trigger(view.container).click(); await new Promise(resolve => setTimeout(resolve, 0)) })
+}
 
- test('0 → 1 suggestions auto-opens the composer popover; 0 suggestions hides it', async () => {
+ test('suggestions show as a badge and never auto-open; the badge click opens the popover', async () => {
   const view = await setup()
   assert.equal(trigger(view.container)?.textContent, 'Harper · 2')
-  assert.equal(view.container.querySelector('[role="dialog"]') !== null, true)
-  assert.equal(popoverAutoFocusLog.at(-1), true, 'auto-open cancels the SDK popover focus transfer')
-  assert.equal(composer.focuses, 0, 'auto-open does not call any composer focus API')
+  assert.equal(view.container.querySelector('[role="dialog"]'), null, 'no auto-open: the badge is all the user sees while typing')
+  assert.equal(composer.focuses, 0, 'arriving suggestions call no composer focus API')
+
+  await openPopover(view)
+  assert.equal(view.container.querySelector('[role="dialog"]') !== null, true, 'the badge click opens the popover')
+
   composer.draft = 'typing continues'
   assert.equal(composer.draft, 'typing continues', 'simulated composer typing remains available while open')
   dispose(view)
@@ -84,10 +91,23 @@ function trigger(node) { return [...node.querySelectorAll('button')].find(button
   dispose(clean)
 })
 
-test('closing suppresses identical rechecks; typing a distinct suggestion opens once', async () => {
+test('typing while the popover is open hides it while the next check runs', async () => {
+  const view = await setup()
+  try {
+    await openPopover(view)
+    assert.ok(view.container.querySelector('[role="dialog"]'))
+    composer.draft = 'Thiss is a mistke, and more typing'
+    await view.poll()
+    assert.equal(view.container.querySelector('[role="dialog"]'), null, 'resumed typing hides the list before the next result lands')
+    assert.equal(trigger(view.container)?.textContent, 'Harper · 2', 'the badge keeps the last count while checking')
+  } finally { dispose(view) }
+})
+
+test('closing stays closed across identical and distinct rechecks until the user opens again', async () => {
   let current = suggestions
   const view = await setup({ result: () => current })
   try {
+    await openPopover(view)
     const button = trigger(view.container)
     assert.ok(button)
     const dialog = view.container.querySelector('[role="dialog"]')
@@ -100,27 +120,33 @@ test('closing suppresses identical rechecks; typing a distinct suggestion opens 
     composer.draft = 'Thiss is a sentenc whit two mistaks'
     current = [...suggestions, { start: 11, end: 18, text: 'sentenc', code: 'new-rule', category: 'spelling', priority: 63, suggestions: ['sentence'] }]
     await recheck(view)
-    assert.equal(view.container.querySelector('[role="dialog"]') !== null, true, 'new typing produced a distinct suggestion set')
+    assert.equal(view.container.querySelector('[role="dialog"]'), null, 'a distinct set updates the badge only — it never reopens on its own')
+    assert.equal(trigger(view.container).textContent, 'Harper · 3')
+
+    await openPopover(view)
+    assert.equal(view.container.querySelector('[role="dialog"]') !== null, true, 'the user can still open it on demand')
   } finally { dispose(view) }
 })
 
-test('an empty result resets dismissal so later suggestions auto-open again', async () => {
+test('an empty result closes the popover; later suggestions arrive as a badge only', async () => {
   let current = suggestions
   const view = await setup({ result: () => current })
   try {
-    act(() => view.container.querySelector('[role="dialog"]')?.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    await openPopover(view)
     current = []
     await recheck(view)
     assert.equal(view.container.querySelector('[role="dialog"]'), null)
     current = suggestions
     await recheck(view)
-    assert.equal(view.container.querySelector('[role="dialog"]') !== null, true)
+    assert.equal(view.container.querySelector('[role="dialog"]'), null, 'new suggestions do not reopen the popover')
+    assert.equal(trigger(view.container).textContent, 'Harper · 2')
   } finally { dispose(view) }
 })
 
 test('Apply correction clicks the whole row and keeps the popover open with remaining checked rows', async () => {
   const view = await setup()
   try {
+    await openPopover(view)
     const row = rows(view.container)[0]
     assert.ok(row)
     assert.equal(row.textContent.includes('Apply correction'), false)
@@ -130,6 +156,9 @@ test('Apply correction clicks the whole row and keeps the popover open with rema
     assert.equal(view.container.querySelector('[role="dialog"]') !== null, true)
     assert.equal(rows(view.container).length, 1)
     assert.equal(view.container.textContent.includes('mistke'), true)
+
+    await view.poll()
+    assert.equal(view.container.querySelector('[role="dialog"]') !== null, true, 'the tick echo of our own apply is not typing and must not hide the popover')
   } finally { dispose(view) }
 })
 
@@ -143,6 +172,7 @@ test('multiple sequential row applications keep the same popover open', async ()
     return [first, second, third]
   } })
   try {
+    await openPopover(view)
     await act(async () => { rows(view.container)[0].click(); await new Promise(resolve => setTimeout(resolve, 0)) })
     assert.equal(rows(view.container).length, 2)
     assert.ok(view.container.querySelector('[role="dialog"]'))
@@ -153,10 +183,11 @@ test('multiple sequential row applications keep the same popover open', async ()
   } finally { dispose(view) }
 })
 
-test('an outside click still dismisses after apply; new suggestions can auto-open once again', async () => {
+test('an outside click still dismisses after apply; a later distinct set stays a badge only', async () => {
   let current = suggestions
   const view = await setup({ result: () => current })
   try {
+    await openPopover(view)
     await act(async () => { rows(view.container)[0].click(); await new Promise(resolve => setTimeout(resolve, 0)) })
     assert.ok(view.container.querySelector('[role="dialog"]'), 'apply retains the open popover')
     act(() => document.body.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true })))
@@ -165,13 +196,15 @@ test('an outside click still dismisses after apply; new suggestions can auto-ope
     composer.draft = 'A different draft with new errors'
     current = [{ start: 0, end: 1, text: 'A', code: 'new-set', category: 'spelling', priority: 63, suggestions: ['A'] }]
     await recheck(view)
-    assert.ok(view.container.querySelector('[role="dialog"]'), 'a later distinct set still auto-opens')
+    assert.equal(view.container.querySelector('[role="dialog"]'), null, 'a later distinct set updates the badge only')
+    assert.equal(trigger(view.container).textContent, 'Harper · 1')
   } finally { dispose(view) }
 })
 
 test('row controls use native keyboard buttons; Ignore only ignores; Apply all still applies', async () => {
   const view = await setup()
   try {
+    await openPopover(view)
     const apply = rows(view.container)[0]
     const ignore = view.container.querySelector('[aria-label="Ignore this suggestion"]')
     assert.equal(apply.tagName, 'BUTTON')
@@ -193,6 +226,7 @@ test('row controls use native keyboard buttons; Ignore only ignores; Apply all s
 test('stale displayed rows cannot change a draft that has moved', async () => {
   const view = await setup()
   try {
+    await openPopover(view)
     composer.draft = 'A completely changed draft.'
     await act(async () => { rows(view.container)[0].click(); await new Promise(resolve => setTimeout(resolve, 0)) })
     assert.equal(composer.draft, 'A completely changed draft.')
@@ -225,6 +259,7 @@ test('an explicitly enabled send path never reapplies the ignored dockge suggest
   const dockge = [{ start: 0, end: 6, text: 'dockge', code: 'spell-dockge', category: 'spelling', priority: 100, suggestions: ["dock's"] }]
   const view = await setup({ draft: 'dockge', result: dockge, correctOnSend: true })
   try {
+    await openPopover(view)
     act(() => view.container.querySelector('[aria-label="Ignore this suggestion"]').click())
     const sent = await view.middleware.data.handler({ text: 'dockge' })
     assert.equal(sent.text, 'dockge')
@@ -241,6 +276,7 @@ test('explicit saved true is preserved, ignored items stay ignored, and other hi
     : two, correctOnSend: true })
   try {
     assert.equal(view.storage.get('settings').correctOnSend, true)
+    await openPopover(view)
     act(() => view.container.querySelector('[aria-label="Ignore this suggestion"]').click())
     const partial = await view.middleware.data.handler({ text: 'dockge Thiss' })
     assert.equal(partial.text, 'dockge This')
@@ -266,6 +302,8 @@ test('underside remains selectable; statusbar is the multiple-composer fallback'
 
   const multiple = await setup({ surfaces: 2 })
   assert.equal(multiple.container.querySelector('[aria-label="Harper, 2 suggestions"]') !== null, true)
+  assert.equal(multiple.container.querySelector('[role="dialog"]'), null, 'the fallback popover opens on click, not on arrival')
+  await openPopover(multiple)
   assert.equal(multiple.container.textContent.includes('Thiss'), true, 'statusbar fallback owns the list')
   dispose(multiple)
 })
@@ -277,6 +315,6 @@ test('palette and keybind contributions expose open suggestions and apply all', 
   assert.ok(palette.some(row => row.label === 'Harper: Open suggestions'))
   assert.ok(palette.some(row => row.label === 'Harper: Apply all suggestions'))
   assert.ok(keys.some(row => row.label === 'Harper: Open suggestions' && row.defaults.includes('mod+alt+h')))
-  assert.ok(keys.some(row => row.label === 'Harper: Apply all suggestions' && row.defaults.includes('mod+alt+shift+h')))
+  assert.ok(keys.some(row => row.label === 'Harper: Apply all suggestions' && row.defaults.includes('mod+alt+a')))
   dispose(view)
 })

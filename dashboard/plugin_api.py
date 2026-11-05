@@ -12,7 +12,7 @@ document for every ``textDocument/codeAction``, so a check is ``lint + (diagnost
 cost)``, and the per-action cost runs from ~14 ms at 1k chars to ~254 ms at 20k.
 ``ACTION_BUDGET_MS`` bounds the second term; the lint itself stays in a few hundred ms.
 
-Three protocol facts this module depends on, all verified against harper-ls 2.12.0:
+Three protocol facts this module depends on, all verified against harper-ls 3.0.0:
 
 * The server sends ``workspace/configuration`` as a server->client REQUEST and BLOCKS until
   it is answered. Never answering means no diagnostics are ever published — the process
@@ -781,7 +781,7 @@ class HarperEngine:
         Returns ``(suggestions, truncated, suppressed)``. ``truncated`` means the code-action
         budget ran out with diagnostics left over, so the list is partial. It cannot be ranked
         before paying: ``priority`` and ``lint_kind`` only exist inside the codeAction, never on
-        the diagnostic (verified on 2.12.0), so the spans are resolved in document order and
+        the diagnostic (verified on 3.0.0), so the spans are resolved in document order and
         stopped on time. ``suppressed`` counts the diagnostics that landed inside machine text
         (paths, inline code, identifiers) and were dropped — see :mod:`technical_spans`.
 

@@ -1,15 +1,16 @@
 # Harper Grammar Coach
 
 Grammar and spelling coaching for the Hermes Desktop chat composer, powered by
-[Harper](https://github.com/Automattic/harper). It lints your draft as you type and opens a
-composer popover for new suggestions. High-confidence fixes on Enter are optional and off by
+[Harper](https://github.com/Automattic/harper). It lints your draft as you type and shows a
+**Harper · N** badge for new suggestions — click the badge to open the list. High-confidence
+fixes on Enter are optional and off by
 default. **Everything runs on your machine** — no text is uploaded, and the engine is a local
 subprocess, not a cloud API.
 
 | | |
 |---|---|
 | Type | Unified Hermes plugin (agent + dashboard API + Desktop surface) |
-| Engine | `harper-ls` over LSP/stdio, one resident process, reaped after 10 idle minutes |
+| Engine | `harper-ls` v3.0.0 over LSP/stdio, one resident process, reaped after 10 idle minutes |
 | Networks | One: the pinned `harper-ls` release download, and only when you press **Install Harper** |
 | License | MIT (this plugin) · Apache-2.0 (Harper, see [NOTICE](NOTICE)) |
 
@@ -62,6 +63,9 @@ once, on purpose:
 That downloads the pinned release asset for your platform (~13–14 MB compressed), checks its
 exact byte size against the release manifest, extracts the executable, and drops it into the
 plugin's `vendor/` directory. The response reports which binary and version it installed.
+The pin lives in `harper_ls.py` (currently **harper-ls v3.0.0**), so a fresh install always
+fetches the version this repository pins — new users get v3.0.0 on first
+Install Harper, not whatever happened to be current when you installed.
 Skip the download entirely if you already have a binary — see *Using your own harper-ls*.
 
 Two more routes reach that same action, in case the Appearance page does not render the row:
@@ -78,7 +82,8 @@ refused with `unsupported-platform` rather than guessed at; use the setting belo
 
 ## Use
 
-Type. When Harper finds suggestions, the composer shows **Harper · N** and opens a popover
+Type. When Harper finds suggestions, the composer shows a **Harper · N** badge. Click the
+badge (or use **Harper: Open suggestions** / `Mod+Alt+H`) to open the popover
 with spelling, capitalisation and grammar rewrites plus their confidence levels. **Click a
 row to apply that suggestion**: the correction row is one accessible button, and Ignore is a
 separate control. **Apply all** stays at the top. The underside list remains available in
@@ -107,10 +112,10 @@ renderer keeps working on its own: while the API is filed as unreachable, the co
 re-checks it with a read-only `GET /status` about every 30 seconds, so a backend that comes back
 restores the chip without a click.
 
-The popover opens once for a new set of visible suggestions. Closing it keeps that set
-dismissed through identical rechecks. A set is distinct when its rule, category, incorrect
-word, or replacement changes; moving the same suggestion to a different offset does not reopen
-it. An empty result resets the cycle. Applying a correction keeps the current open state and
+The popover never opens on its own. An auto-opening list covers the tail of whatever you are
+typing — most visibly on long drafts, where the sentence runs under the panel — so new
+suggestions only update the badge. If you resume typing while the list is open, it closes
+while the next check runs; applying a correction keeps the current open state and
 verified remaining suggestions while Harper re-checks.
 
 After you apply one, its row disappears immediately and the remaining rows stay on screen
@@ -152,13 +157,23 @@ Applying a suggestion moves the caret to the end of the draft. That is a documen
 the composer API available to a plugin, not a choice made per case.
 
 Palette commands: **Harper: Check draft now**, **Harper: Open suggestions**, **Harper: Apply
-all suggestions**, and a toggle for live checking. Keyboard shortcuts are available for
-opening suggestions and applying all.
+all suggestions**, and a toggle for live checking.
+
+Keyboard shortcuts (both rebindable under **Settings ▸ Keyboard Shortcuts**, and both listed
+there with their live combos):
+
+- `Mod+Alt+H` (Ctrl+Alt+H on Windows) — open suggestions.
+- `Mod+Alt+A` (Ctrl+Alt+A on Windows) — apply all suggestions.
+
+The two chords intentionally use *different letters* — a shift-only distinction between
+them previously caused stray Shift presses to mass-apply with no popup. Stored rebinds in
+the shortcuts panel override these defaults; reset a Harper row there to pick the defaults
+back up.
 
 ### What Harper itself will not tell you
 
 The engine is Harper (`harper-ls`), and the plugin shows what Harper returns — no more.
-Measured on harper-ls 2.12.0: `Thiss is a sentenc whit two mistaks` produces three
+Measured on harper-ls 3.0.0: `Thiss is a sentenc whit two mistaks` produces three
 suggestions, but `This are a simple test.` and `There is many reasons why this happens.`
 produce nothing at all, because Harper's agreement rules cover pronoun-plus-*be*
 (`I is ready.`, `He are working.`) and a bare plural (`There is dogs.`), not
@@ -193,10 +208,11 @@ Agent half and its provenance record. The shared Desktop half remains while anot
 still has the package installed; Hermes removes it when no installed profile supplies it and
 the Desktop plugin inventory is reconciled.
 
-`harper_ls.py` owns the engine version pin, so a plugin update can move to a different
-`harper-ls` release. The new binary is fetched on the next **Install Harper** action rather
-than silently replaced under a running process. `vendor/` is gitignored and belongs to the
-profile's plugin installation; it is not part of the Git repository.
+`harper_ls.py` owns the engine version pin (currently v3.0.0), so a plugin update can move
+to a different `harper-ls` release. A plugin update alone does **not** replace a resident
+binary: press **Install Harper** again after updating to fetch the newly pinned release —
+it checks the size, replaces `vendor/`, and the next engine start picks it up. `vendor/` is gitignored
+and belongs to the profile's plugin installation; it is not part of the Git repository.
 
 ## Troubleshooting
 
@@ -213,6 +229,8 @@ profile's plugin installation; it is not part of the Git repository.
 | A mistake you can see is not offered | Usually Harper, not the filter. `GET …/check` reports `diagnosticCount` (what Harper raised) and `technicalSuppressed` (what the plugin dropped as machine text); if both are 0 the engine never flagged it. See "What Harper itself will not tell you". |
 | Long drafts stop getting suggestions | The text is truncated to a bound and the Harper UI says so; Harper re-parses the whole document per action, so cost grows with length. |
 | Engine vanished after a while | It reaps itself after 10 minutes idle, by design, and restarts on the next check. |
+| The Plugins page shows several Harper rows for one profile | Orphaned `.harper-grammar-coach.remove-*` temp directories from remove/reinstall cycles carry a valid `plugin.yaml` and get inventoried as extra installs. Delete those hidden dirs (keep the real `harper-grammar-coach/` one) and the list collapses to one row. |
+| Updated the plugin but the engine version did not change | The pin move needs a fresh binary: press **Install Harper** again (or delete `vendor/` first if the old process still holds the file). The Engine row reports the running version. |
 
 ## Known Hermes Desktop install blocker
 

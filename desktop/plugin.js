@@ -634,32 +634,10 @@ const $dismissed = atom(null)
 /** Count of mounted underside surfaces (main composer + any tiles/HUD). */
 const $surfaces = atom(0)
 const $suggestionsOpen = atom(false)
-/** Last set the user closed; an identical recheck remains dismissed. */
-const $dismissedSuggestionSet = atom(null)
-// Radix normally focuses the first popover item on open and dismisses when
-// focus moves to the composer. Auto-open is visual-only; row application is
-// the one deliberate outside-focus transition that must keep the popover up.
-const $autoOpened = atom(false)
+/** True while a suggestion apply's `setDraft` focus return is in flight, so the
+ *  deliberate outside-focus transition does not dismiss the popover the user
+ *  is interacting with. */
 const $applyingSuggestion = atom(false)
-
-function suggestionSetKey(items) {
-  const parts = items.map(item => [
-    String(item?.code ?? ''),
-    String(item?.category ?? ''),
-    String(item?.text ?? ''),
-    String(replacementOf(item) ?? '')
-  ])
-  parts.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
-  return JSON.stringify(parts)
-}
-
-function closeSuggestionsPopover() {
-  const check = $check.get()
-  const items = visibleItems(check.suggestions, $ignored.get(), check.text)
-  $dismissedSuggestionSet.set(items.length ? suggestionSetKey(items) : null)
-  $suggestionsOpen.set(false)
-  $autoOpened.set(false)
-}
 
 // --- engine ------------------------------------------------------------------
 
@@ -694,7 +672,9 @@ export function createEngine(ctx) {
   let warmAttemptNumber = 0
   let warmStartedAt = 0
   let warmReadyAt = 0
-  let suppressAutoOpenText = null
+  /** The exact draft text of our own apply (`setDraft`), so the next tick's
+   *  "new draft" handling does not read it as the user typing. */
+  let ownWriteText = null
   let applyFocusGuardTimer = null
   /** Cadence bookkeeping for the recovery probe: `lastProbeAt` is the only thing standing between
    *  a downed backend and a `/status` every 250 ms, and `probePromise` collapses the concurrent
@@ -702,14 +682,19 @@ export function createEngine(ctx) {
   let lastProbeAt = 0
   let probePromise = null
 
+  // Suggestions are shown as a badge (`Harper · N`) and never open on their
+  // own — an auto-opening popover covers the tail of whatever the user is
+  // typing. The popover is opened by the user's click (or palette/keybind) and
+  // closed by the user, by an emptied list, or by typing resuming.
   const publish = next => {
     if (!disposed) {
       $check.set(next)
 
       if (next.state === 'checking') {
-        if (!visibleItems(next.suggestions, $ignored.get(), next.text).length) {
-          $suggestionsOpen.set(false)
-        }
+        // Typing resumed: hide the list while the next check runs. The one
+        // exception is our own apply echo (`ownWriteText`), where the popover
+        // the user is interacting with must stay up.
+        if (next.text !== ownWriteText) $suggestionsOpen.set(false)
         return
       }
 
@@ -717,19 +702,7 @@ export function createEngine(ctx) {
 
       if (!items.length) {
         $suggestionsOpen.set(false)
-        $dismissedSuggestionSet.set(null)
-        if (next.text === suppressAutoOpenText) suppressAutoOpenText = null
-        return
-      }
-
-      const key = suggestionSetKey(items)
-
-      if (next.text === suppressAutoOpenText) {
-        if (!$suggestionsOpen.get()) $dismissedSuggestionSet.set(key)
-        suppressAutoOpenText = null
-      } else if ($dismissedSuggestionSet.get() !== key) {
-        $autoOpened.set(true)
-        $suggestionsOpen.set(true)
+        if (next.text === ownWriteText) ownWriteText = null
       }
     }
   }
@@ -954,11 +927,14 @@ export function createEngine(ctx) {
     }
 
     // A new draft supersedes anything in flight and restarts the debounce.
+    // Our own apply echo is not the user typing: `publish` keeps the popover
+    // up for it, and the marker is consumed here.
+    const isOwnWrite = text === ownWriteText
     lastSeen = text
     generation += 1
-    if (text !== suppressAutoOpenText) suppressAutoOpenText = null
     dueAt = Date.now() + debounceMs(settings.debounce)
     publish({ state: 'checking', text, suggestions: keepRows() })
+    if (isOwnWrite) ownWriteText = null
   }
 
   /** A check for an EXACT text, bypassing the generation logic — the middleware
@@ -1044,7 +1020,7 @@ export function createEngine(ctx) {
     lastSeen = null
     dueAt = Date.now()
     $dismissed.set(null)
-    suppressAutoOpenText = folded.text
+    ownWriteText = folded.text
     // Hold the rows that are still true of the NEW draft, at their new offsets, while the
     // recheck runs. Collapsing to an empty list here is what made every click flicker; the
     // re-verification inside `survivorsAfterApply` is what keeps a stale row from being
@@ -1066,7 +1042,6 @@ export function createEngine(ctx) {
     const check = $check.get()
     if (!visibleItems(check.suggestions, next, check.text).length) {
       $suggestionsOpen.set(false)
-      $dismissedSuggestionSet.set(null)
     }
   }
 
@@ -1538,12 +1513,7 @@ function ComposerPopover({ engine }) {
 
   return jsxs(Popover, {
       open,
-    onOpenChange: next => {
-      if (next) {
-        $autoOpened.set(false)
-        $suggestionsOpen.set(true)
-      } else closeSuggestionsPopover()
-    },
+    onOpenChange: next => $suggestionsOpen.set(next),
     children: [
       jsx(PopoverTrigger, {
         asChild: true,
@@ -1556,7 +1526,14 @@ function ComposerPopover({ engine }) {
       }, 'trigger'),
       jsx(PopoverContent, {
         side: 'top', align: 'start', className: 'hgc-pop',
-        onOpenAutoFocus: event => { if ($autoOpened.get()) event.preventDefault() },
+        onOpenAutoFocus: event => {
+          // Radix's default target is the first focusable element in the
+          // popover — the header's "Apply all" button. Landing there means a
+          // following Enter mass-applies without the user ever reviewing a
+          // row, so focus moves to the first suggestion row instead.
+          event.preventDefault()
+          event.currentTarget?.querySelector?.('.hgc-apply-row')?.focus()
+        },
         onFocusOutside: event => { if ($applyingSuggestion.get()) event.preventDefault() },
         children: jsxs('div', { className: 'hgc-pop-body', children: [
           jsxs('div', { className: 'hgc-row', children: [
@@ -1791,7 +1768,7 @@ function StatusChip({ engine }) {
   return jsxs(Popover, {
     open: popoverOpen,
     onOpenChange: next => {
-      if (showSuggestions) next ? $suggestionsOpen.set(true) : closeSuggestionsPopover()
+      if (showSuggestions) $suggestionsOpen.set(next)
       else setOpen(next)
       if (next) void engine.refreshStatus()
     },
@@ -2026,9 +2003,7 @@ export default {
     $dismissed.set(null)
     $surfaces.set(0)
     $suggestionsOpen.set(false)
-    $autoOpened.set(false)
     $applyingSuggestion.set(false)
-    $dismissedSuggestionSet.set(null)
     $check.set(IDLE_CHECK)
 
     const style = document.createElement('style')
@@ -2219,7 +2194,7 @@ export default {
         data: {
           id: 'harper.applyAll',
           category: 'view',
-          defaults: ['mod+alt+shift+h'],
+          defaults: ['mod+alt+a'],
           label: 'Harper: Apply all suggestions',
           run: () => void applyAllFromCurrent()
         }

@@ -6,7 +6,7 @@ run time, and how a missing one is downloaded. ``dashboard/plugin_api.py`` consu
 module and holds no release facts of its own, so bumping Harper means editing one table.
 
 The release manifest this pins was verified against GitHub's
-``Automattic/harper`` tag ``v2.12.0``; the byte sizes are the release asset sizes, not
+``Automattic/harper`` tag ``v3.0.0``; the byte sizes are the release asset sizes, not
 guesses, so a truncated or substituted download is caught before anything is spawned.
 
 The binary is NEVER part of this repository. ``POST /bootstrap`` (and
@@ -35,19 +35,19 @@ PLUGIN_ID = "harper-grammar-coach"
 PLUGIN_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = PLUGIN_DIR / "vendor"
 
-HARPER_VERSION = "2.12.0"
+HARPER_VERSION = "3.0.0"
 
 #: ``(platform.system(), platform.machine())`` -> ``(release asset, exact byte size)``.
 #: Keys are what ``platform.system()`` / ``platform.machine()`` actually report on those
 #: builds; :func:`platform_asset` also tries the AMD64/x86_64 alias. Only assets that
 #: exist in the pinned release are listed, which is why there is no Windows ARM64 entry.
 RELEASE_ASSETS: Dict[Tuple[str, str], Tuple[str, int]] = {
-    ("Windows", "AMD64"): ("harper-ls-x86_64-pc-windows-msvc.zip", 13_495_461),
-    ("Windows", "x86_64"): ("harper-ls-x86_64-pc-windows-msvc.zip", 13_495_461),
-    ("Darwin", "x86_64"): ("harper-ls-x86_64-apple-darwin.tar.gz", 13_827_650),
-    ("Darwin", "arm64"): ("harper-ls-aarch64-apple-darwin.tar.gz", 9_617_607),
-    ("Linux", "x86_64"): ("harper-ls-x86_64-unknown-linux-gnu.tar.gz", 14_453_853),
-    ("Linux", "aarch64"): ("harper-ls-aarch64-unknown-linux-gnu.tar.gz", 9_908_659),
+    ("Windows", "AMD64"): ("harper-ls-x86_64-pc-windows-msvc.zip", 13_659_654),
+    ("Windows", "x86_64"): ("harper-ls-x86_64-pc-windows-msvc.zip", 13_659_654),
+    ("Darwin", "x86_64"): ("harper-ls-x86_64-apple-darwin.tar.gz", 13_970_863),
+    ("Darwin", "arm64"): ("harper-ls-aarch64-apple-darwin.tar.gz", 13_865_611),
+    ("Linux", "x86_64"): ("harper-ls-x86_64-unknown-linux-gnu.tar.gz", 14_604_005),
+    ("Linux", "aarch64"): ("harper-ls-aarch64-unknown-linux-gnu.tar.gz", 14_124_310),
 }
 
 RELEASE_URL_BASE = f"https://github.com/Automattic/harper/releases/download/v{HARPER_VERSION}/"
