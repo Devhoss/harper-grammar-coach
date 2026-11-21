@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-21
+
+### Added
+- `scripts/update-harper-engine.sh` — fetch the latest (or a pinned) `harper-ls` release into a
+  stable directory outside every plugin tree, for users who point `HARPER_LS_PATH` at it.
+- README/CONTRIBUTING: document that Hermes plugin updates wipe `vendor/`, and that
+  `HARPER_LS_PATH` is the durable answer (the engine then never needs re-fetching after updates).
+
 ## [0.3.0] - 2026-11-05
 
 ### Changed
