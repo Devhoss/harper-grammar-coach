@@ -162,6 +162,32 @@ silently on a user's machine. To move versions:
    three `harper-ls` protocol behaviors the engine depends on. If a release changes one of
    them, that is an engine change, not a version bump.
 
+## Keeping a stable engine across updates
+
+`hermes plugins update` replaces the whole plugin tree, so a vendored engine
+(`vendor/harper-ls.exe`) disappears on every update and the plugin flips back to
+*Harper · Install required*. For development against a live profile, keep the
+binary outside the tree and set `HARPER_LS_PATH` (one-time):
+
+```bash
+mkdir -p /e/hermes/harper-bin
+cp vendor/harper-ls.exe /e/hermes/harper-bin/harper-ls.exe   # or fetch it fresh
+export HARPER_LS_PATH="E:/hermes/harper-bin/harper-ls.exe"   # add to ~/.bashrc
+```
+
+The `scripts/update-harper-engine.sh` script (repo root) fetches the latest
+GitHub release into `E:/hermes/harper-bin` and verifies the platform asset, so
+it doubles as a dev-time updater:
+
+```bash
+bash scripts/update-harper-engine.sh           # latest release
+bash scripts/update-harper-engine.sh 3.1.0    # pin a version
+bash scripts/update-harper-engine.sh --force  # re-download
+```
+
+`HARPER_LS_PATH` wins over `vendor/` in `resolve_binary()`, so updates never
+touch it and you never re-fetch the engine after a plugin update.
+
 ## Style
 
 - `ruff` config lives in `pyproject.toml`: line length 120, rules `E,F,I,B`, `E501`/`E402`

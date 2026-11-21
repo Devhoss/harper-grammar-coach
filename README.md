@@ -214,6 +214,17 @@ binary: press **Install Harper** again after updating to fetch the newly pinned 
 it checks the size, replaces `vendor/`, and the next engine start picks it up. `vendor/` is gitignored
 and belongs to the profile's plugin installation; it is not part of the Git repository.
 
+**Updates wipe `vendor/`.** Hermes' plugin update replaces the whole plugin tree, so an
+in-place engine lives only until the next update — the vendored binary, and any engine you
+installed with Install Harper, are gone, and the statusbar flips back to
+**Harper · Install required** until you fetch again. Two ways around it:
+
+- **Point at a binary that lives outside every plugin tree** — set `HARPER_LS_PATH` (see
+  *Using your own harper-ls*), which wins over `vendor/` and survives updates, reinstalls and
+  profile switches alike.
+- **Re-fetch deliberately after each update** — press **Install Harper** again. Cheap, but it
+  is the one manual step you will repeat forever.
+
 ## Troubleshooting
 
 | Symptom | What it means |
